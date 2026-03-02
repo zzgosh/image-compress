@@ -1,0 +1,175 @@
+openapi: 3.0.3
+info:
+  title: Image Compress API
+  version: 0.1.0
+  description: |
+    Image compression API designed for VPS deployment.
+
+    Notes:
+    - Output format always matches the detected input format (JPEG/PNG/WebP). Format conversion is not supported.
+    - Input format is detected from file bytes (not file extension nor multipart content-type).
+    - Compression settings are fixed server-side (no request parameters for tuning).
+    - If re-encoding produces a larger or equal output, the service falls back to the original bytes.
+servers:
+  - url: http://localhost:3001
+
+tags:
+  - name: health
+  - name: compress
+
+paths:
+  /healthz:
+    get:
+      tags:
+        - health
+      summary: Health check
+      operationId: healthz
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                required:
+                  - status
+
+  /api/v1/compress:
+    post:
+      tags:
+        - compress
+      summary: Compress uploaded images
+      operationId: compressImages
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                files:
+                  description: One or more images to compress.
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                zipName:
+                  description: Optional filename for ZIP response (only used when multiple files are uploaded).
+                  type: string
+                  example: my_batch
+              required:
+                - files
+      responses:
+        '200':
+          description: Compressed output (single image or ZIP for multiple images).
+          headers:
+            X-Original-Bytes:
+              schema:
+                type: string
+              description: Sum of original input bytes.
+              example: '123456'
+            X-Compressed-Bytes:
+              schema:
+                type: string
+              description: Sum of output bytes.
+              example: '78901'
+            X-Compression-Ratio:
+              schema:
+                type: string
+              description: Percentage saved, formatted with 2 decimals.
+              example: '36.12'
+            Content-Disposition:
+              schema:
+                type: string
+              description: Attachment filename for the output.
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorPayload'
+        '401':
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorPayload'
+        '413':
+          description: Payload too large.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorPayload'
+        '415':
+          description: Unsupported media type.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorPayload'
+        '422':
+          description: Processing failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorPayload'
+        '500':
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorPayload'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+  schemas:
+    ApiErrorCode:
+      type: string
+      enum:
+        - INVALID_ARGUMENT
+        - UNAUTHORIZED
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED_MEDIA_TYPE
+        - PROCESSING_FAILED
+        - INTERNAL_ERROR
+    ApiErrorPayload:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              $ref: '#/components/schemas/ApiErrorCode'
+            message:
+              type: string
+          required:
+            - code
+            - message
+      required:
+        - error

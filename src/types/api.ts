@@ -1,7 +1,3 @@
-export type TargetFormat = 'keep' | 'jpg' | 'png' | 'webp'
-
-export type OutputMode = 'auto' | 'image' | 'zip'
-
 export type ApiErrorCode =
   | 'INVALID_ARGUMENT'
   | 'UNAUTHORIZED'
@@ -17,16 +13,9 @@ export interface ApiErrorPayload {
   }
 }
 
-export interface CompressionRequestOptions {
-  quality: number
-  targetFormat: TargetFormat
-  output: OutputMode
-}
-
 export interface UploadedImage {
   buffer: Buffer
   fileName: string
-  mimeType: string
   byteLength: number
 }
 

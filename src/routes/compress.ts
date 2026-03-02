@@ -5,12 +5,7 @@ import {
   MAX_FILE_BYTES,
   MAX_FILE_COUNT,
   MAX_TOTAL_BYTES,
-  PROCESSING_CONCURRENCY,
-  getDefaultUploadFileName,
-  isSupportedInputMimeType,
-  normalizeImageMimeType,
   normalizeZipName,
-  parseCompressionOptions,
   sanitizeFileName
 } from '../lib/validate.js'
 import { createZipStream } from '../lib/zip.js'
@@ -29,6 +24,16 @@ const normalizeFieldValue = (value: unknown): string => {
   return `${value ?? ''}`
 }
 
+const drainReadable = async (stream: NodeJS.ReadableStream): Promise<void> => {
+  try {
+    for await (const _ of stream) {
+      // discard
+    }
+  } catch {
+    // best-effort drain, ignore errors here
+  }
+}
+
 const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, options) => {
   app.post('/api/v1/compress', async (request, reply) => {
     assertAuthorized(request.headers.authorization, options.apiToken)
@@ -41,6 +46,7 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
     const files: UploadedImage[] = []
     let totalBytes = 0
     let fileIndex = 0
+    let firstError: HttpError | undefined
 
     const parts = request.parts({
       limits: {
@@ -52,38 +58,60 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
 
     for await (const part of parts) {
       if (part.type === 'file') {
-        fileIndex += 1
-        const normalizedMimeType = normalizeImageMimeType(part.mimetype)
-        if (!isSupportedInputMimeType(normalizedMimeType)) {
-          throw new HttpError(415, 'UNSUPPORTED_MEDIA_TYPE', 'only jpg, png, webp files are allowed')
+        // 如果已经判定请求无效，继续把 multipart 流读完，避免请求悬挂。
+        if (firstError) {
+          await drainReadable(part.file)
+          continue
+        }
+
+        if (part.fieldname !== 'files') {
+          firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'file field name must be files')
+          await drainReadable(part.file)
+          continue
         }
 
         const fileBuffer = await part.toBuffer()
         totalBytes += fileBuffer.length
         if (totalBytes > MAX_TOTAL_BYTES) {
-          throw new HttpError(413, 'PAYLOAD_TOO_LARGE', `total upload size exceeds ${MAX_TOTAL_BYTES} bytes`)
+          firstError ??= new HttpError(413, 'PAYLOAD_TOO_LARGE', `total upload size exceeds ${MAX_TOTAL_BYTES} bytes`)
+          continue
         }
 
-        const fallbackName = getDefaultUploadFileName(fileIndex, normalizedMimeType)
+        fileIndex += 1
+        const fallbackName = `image_${fileIndex}`
         const fileName = sanitizeFileName(part.filename ?? '', fallbackName)
 
         files.push({
           buffer: fileBuffer,
           fileName,
-          mimeType: normalizedMimeType,
           byteLength: fileBuffer.length
         })
       } else {
-        fields[part.fieldname] = normalizeFieldValue(part.value)
+        const value = normalizeFieldValue(part.value)
+
+        if (part.fieldname === 'zipName') {
+          fields.zipName = value
+          continue
+        }
+
+        if (part.fieldname === 'quality' || part.fieldname === 'targetFormat' || part.fieldname === 'output') {
+          firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'quality/targetFormat/output are not supported')
+          continue
+        }
+
+        firstError ??= new HttpError(400, 'INVALID_ARGUMENT', `unsupported field: ${part.fieldname}`)
       }
+    }
+
+    if (firstError) {
+      throw firstError
     }
 
     if (files.length === 0) {
       throw new HttpError(400, 'INVALID_ARGUMENT', 'files is required')
     }
 
-    const optionsFromRequest = parseCompressionOptions(fields)
-    const compressedFiles = await compressImages(files, optionsFromRequest, PROCESSING_CONCURRENCY)
+    const compressedFiles = await compressImages(files)
 
     const originalBytes = sumBytes(files.map((file) => file.byteLength))
     const compressedBytes = sumBytes(compressedFiles.map((file) => file.compressedBytes))
@@ -93,8 +121,7 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
     reply.header('X-Compressed-Bytes', String(compressedBytes))
     reply.header('X-Compression-Ratio', ratio)
 
-    const shouldReturnZip = optionsFromRequest.output === 'zip' || compressedFiles.length > 1
-    if (!shouldReturnZip) {
+    if (compressedFiles.length === 1) {
       const file = compressedFiles[0]
       if (!file) {
         throw new HttpError(500, 'INTERNAL_ERROR', 'compressed output is empty')

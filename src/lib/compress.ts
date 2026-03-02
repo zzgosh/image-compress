@@ -1,6 +1,9 @@
 import pLimit from 'p-limit'
 import sharp from 'sharp'
-import { HttpError, type CompressedImageResult, type CompressionRequestOptions, type TargetFormat, type UploadedImage } from '../types/api.js'
+import { HttpError, type CompressedImageResult, type UploadedImage } from '../types/api.js'
+import { MAX_IMAGE_PIXELS, PROCESSING_CONCURRENCY } from './validate.js'
+
+type SupportedImageFormat = 'jpg' | 'png' | 'webp'
 
 const OUTPUT_FORMAT_TO_MIME = {
   jpg: 'image/jpeg',
@@ -14,12 +17,21 @@ const OUTPUT_FORMAT_TO_EXTENSION = {
   webp: 'webp'
 } as const
 
-const SHARP_FORMAT_TO_TARGET: Record<string, Exclude<TargetFormat, 'keep'> | undefined> = {
+const SHARP_FORMAT_TO_TARGET: Record<string, SupportedImageFormat | undefined> = {
   jpeg: 'jpg',
   png: 'png',
   webp: 'webp'
 }
 const OUTPUT_NAME_SUFFIX = '_compressed'
+
+// 固定压缩配置：服务侧死配置，不对外暴露参数，避免 API 复杂度扩散。
+const JPEG_QUALITY = 75
+const WEBP_QUALITY = 75
+const PNG_PALETTE_QUALITY = 75
+const PNG_PALETTE_EFFORT = 7
+const PNG_PALETTE_DITHER = 0
+
+const globalLimit = pLimit(PROCESSING_CONCURRENCY)
 
 const splitFileName = (fileName: string): { baseName: string; extension: string } => {
   const lastDotIndex = fileName.lastIndexOf('.')
@@ -33,37 +45,53 @@ const splitFileName = (fileName: string): { baseName: string; extension: string 
   }
 }
 
-const buildOutputFileName = (sourceFileName: string, format: Exclude<TargetFormat, 'keep'>, forceTargetFormat: boolean): string => {
+const buildOutputFileName = (sourceFileName: string, format: SupportedImageFormat): string => {
   const parts = splitFileName(sourceFileName)
   const normalizedBase = parts.baseName.endsWith(OUTPUT_NAME_SUFFIX) ? parts.baseName : `${parts.baseName}${OUTPUT_NAME_SUFFIX}`
 
-  if (!forceTargetFormat && parts.extension) {
-    return `${normalizedBase}.${parts.extension}`
+  // JPEG 文件名兼容：如果输入文件扩展名为 .jpeg，则输出也使用 .jpeg（仍为 image/jpeg）。
+  if (format === 'jpg' && parts.extension.toLowerCase() === 'jpeg') {
+    return `${normalizedBase}.jpeg`
   }
 
   return `${normalizedBase}.${OUTPUT_FORMAT_TO_EXTENSION[format]}`
 }
 
-const encodeImage = async (inputBuffer: Buffer, format: Exclude<TargetFormat, 'keep'>, quality: number): Promise<Buffer> => {
-  const pipeline = sharp(inputBuffer, { failOn: 'warning' })
+const createPipeline = (inputBuffer: Buffer): sharp.Sharp =>
+  sharp(inputBuffer, { failOn: 'warning', limitInputPixels: MAX_IMAGE_PIXELS }).rotate()
+
+const encodeImage = async (inputBuffer: Buffer, format: SupportedImageFormat): Promise<Buffer> => {
+  const pipeline = createPipeline(inputBuffer)
 
   if (format === 'jpg') {
-    return pipeline.jpeg({ quality, mozjpeg: true }).toBuffer()
+    return pipeline.jpeg({ quality: JPEG_QUALITY, mozjpeg: true }).toBuffer()
   }
 
   if (format === 'webp') {
-    return pipeline.webp({ quality }).toBuffer()
+    return pipeline.webp({ quality: WEBP_QUALITY }).toBuffer()
   }
 
-  return pipeline.png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer()
+  // PNG: 通过 palette 量化实现可观的体积下降（有损），并用 dither=0 降低噪点。
+  // 仍保留“变大回退原图”，确保不会因为再编码导致体积增长。
+  return pipeline.png({ quality: PNG_PALETTE_QUALITY, effort: PNG_PALETTE_EFFORT, dither: PNG_PALETTE_DITHER }).toBuffer()
 }
 
-const detectSourceFormat = async (inputBuffer: Buffer): Promise<Exclude<TargetFormat, 'keep'>> => {
+const detectSourceInfo = async (inputBuffer: Buffer): Promise<{ format: SupportedImageFormat; needsRotate: boolean }> => {
   let metadata: sharp.Metadata
   try {
-    metadata = await sharp(inputBuffer).metadata()
+    metadata = await sharp(inputBuffer, { failOn: 'warning', limitInputPixels: MAX_IMAGE_PIXELS }).metadata()
   } catch (error) {
+    const message = (error as Error)?.message ?? ''
+    if (message.includes('pixel limit')) {
+      throw new HttpError(413, 'PAYLOAD_TOO_LARGE', 'image resolution exceeds pixel limit')
+    }
     throw new HttpError(422, 'PROCESSING_FAILED', 'failed to decode image')
+  }
+
+  const width = metadata.width ?? 0
+  const height = metadata.height ?? 0
+  if (width > 0 && height > 0 && width * height > MAX_IMAGE_PIXELS) {
+    throw new HttpError(413, 'PAYLOAD_TOO_LARGE', 'image resolution exceeds pixel limit')
   }
 
   const detectedFormat = metadata.format ? SHARP_FORMAT_TO_TARGET[metadata.format] : undefined
@@ -71,30 +99,41 @@ const detectSourceFormat = async (inputBuffer: Buffer): Promise<Exclude<TargetFo
     throw new HttpError(415, 'UNSUPPORTED_MEDIA_TYPE', 'only jpg, png, webp images are supported')
   }
 
-  return detectedFormat
+  const orientation = metadata.orientation
+  const needsRotate = typeof orientation === 'number' && orientation !== 1
+
+  return { format: detectedFormat, needsRotate }
 }
 
-const compressSingleImage = async (file: UploadedImage, options: CompressionRequestOptions): Promise<CompressedImageResult> => {
-  const sourceFormat = await detectSourceFormat(file.buffer)
-  const forceTargetFormat = options.targetFormat !== 'keep'
-  const targetFormat: Exclude<TargetFormat, 'keep'> = forceTargetFormat
-    ? (options.targetFormat as Exclude<TargetFormat, 'keep'>)
-    : sourceFormat
+const compressSingleImage = async (file: UploadedImage): Promise<CompressedImageResult> => {
+  const source = await detectSourceInfo(file.buffer)
+  const sourceFormat = source.format
 
-  let outputBuffer = await encodeImage(file.buffer, targetFormat, options.quality)
-  let outputFormat: Exclude<TargetFormat, 'keep'> = targetFormat
+  let outputBuffer: Buffer
+  try {
+    outputBuffer = await encodeImage(file.buffer, sourceFormat)
+  } catch (error) {
+    const message = (error as Error)?.message ?? ''
+    if (message.includes('pixel limit')) {
+      throw new HttpError(413, 'PAYLOAD_TOO_LARGE', 'image resolution exceeds pixel limit')
+    }
+    throw new HttpError(422, 'PROCESSING_FAILED', 'failed to encode image')
+  }
+
+  let outputFormat: SupportedImageFormat = sourceFormat
   let usedFallback = false
 
-  if (!forceTargetFormat && outputBuffer.length >= file.byteLength) {
+  // 统一启用“变大回退原图”，避免再编码导致体积增长。
+  // 例外：当输入包含 EXIF Orientation 时，优先保证输出方向正确，不回退到原图。
+  if (outputBuffer.length >= file.byteLength && !source.needsRotate) {
     outputBuffer = file.buffer
-    outputFormat = sourceFormat
     usedFallback = true
   }
 
   return {
     sourceFileName: file.fileName,
-    fileName: buildOutputFileName(file.fileName, outputFormat, forceTargetFormat),
-    inputMimeType: file.mimeType,
+    fileName: buildOutputFileName(file.fileName, outputFormat),
+    inputMimeType: OUTPUT_FORMAT_TO_MIME[sourceFormat],
     outputMimeType: OUTPUT_FORMAT_TO_MIME[outputFormat],
     originalBytes: file.byteLength,
     compressedBytes: outputBuffer.length,
@@ -103,11 +142,5 @@ const compressSingleImage = async (file: UploadedImage, options: CompressionRequ
   }
 }
 
-export const compressImages = async (
-  files: UploadedImage[],
-  options: CompressionRequestOptions,
-  concurrency: number
-): Promise<CompressedImageResult[]> => {
-  const limit = pLimit(concurrency)
-  return Promise.all(files.map((file) => limit(() => compressSingleImage(file, options))))
-}
+export const compressImages = async (files: UploadedImage[]): Promise<CompressedImageResult[]> =>
+  Promise.all(files.map((file) => globalLimit(() => compressSingleImage(file))))

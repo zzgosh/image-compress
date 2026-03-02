@@ -1,14 +1,19 @@
 # Image Compress API
 
-面向 VPS + Docker + Nginx 的图片压缩服务，支持 `jpg/png/webp` 输入，使用 `quality` 控制压缩参数。
+面向 VPS + Docker + Nginx 的图片压缩服务，支持 `jpg/png/webp` 输入。压缩参数在服务端固定配置，不通过 API 暴露可调参数，以降低使用与维护成本。
 
 ## Features
 
 - `POST /api/v1/compress`，`multipart/form-data` 上传
 - Bearer Token 鉴权（单一共享 Token）
 - 单图返回图片、多图自动返回 ZIP
-- 可选输出格式：`keep|jpg|png|webp`
-- `targetFormat=keep` 时启用“压缩变大回退原图”
+- 输出格式与输入格式保持一致（不支持转换输出格式）
+- 输入格式以文件内容检测为准（不以扩展名/MIME 为准；重命名不等于转格式）
+- JPEG 文件名兼容：若上传文件名为 `.jpeg`，输出也使用 `.jpeg` 扩展名（内容仍为 `image/jpeg`）
+- 固定压缩参数：
+  - JPEG/WebP：固定 `quality=75`
+  - PNG：使用 palette 量化的固定配置（有损），并启用“变大回退原图”
+- 统一启用“压缩变大回退原图”（避免再编码导致体积增长）
 - 默认限制：单图 `20MB`、最多 `30` 张、总计 `80MB`
 
 ## Quick Start (Local)
@@ -67,6 +72,8 @@ curl http://127.0.0.1:3001/healthz
 
 ## API Contract
 
+完整的 OpenAPI 规格见 `openapi.yaml`。
+
 ### Endpoint
 
 `POST /api/v1/compress`
@@ -82,16 +89,13 @@ curl http://127.0.0.1:3001/healthz
 ### Form Fields
 
 - `files` (required, repeatable)
-- `quality` (optional, integer `1..100`, default `75`)
-- `targetFormat` (optional, enum `keep|jpg|png|webp`, default `keep`)
-- `output` (optional, enum `auto|image|zip`, default `auto`)
 - `zipName` (optional, filename for ZIP response)
+- Other fields are not supported and will return `400 INVALID_ARGUMENT`.
 
 ### Response Rules
 
-- Single file + `output=auto|image` => image binary
-- Multiple files => `application/zip` (even if `output=image`)
-- `output=zip` => `application/zip`
+- Single file => image binary (same format as input)
+- Multiple files => `application/zip`
 - 输出文件名默认基于原文件名追加 `_compressed` 后缀（例如 `a.png` => `a_compressed.png`）
 
 ### Response Headers
@@ -106,7 +110,7 @@ curl http://127.0.0.1:3001/healthz
 {
   "error": {
     "code": "INVALID_ARGUMENT",
-    "message": "quality must be between 1 and 100"
+    "message": "file field name must be files"
   }
 }
 ```
@@ -132,7 +136,10 @@ TOKEN="$(grep '^API_TOKEN=' .env | cut -d= -f2-)"
 
 - API 服务只返回二进制响应，不会写入你的本地磁盘或 VPS 的固定目录
 - 保存到哪里由客户端决定（`curl`、网页前端、Shortcuts）
-- `curl -o xx.jpg` 会保存到当前命令执行目录（或你写的绝对路径）
+- `curl -o /path/to/save/out.jpg` 是指定“输出文件路径 + 文件名”，不是只指定目录
+- 如果你希望“只指定保存目录，并使用服务端返回的文件名（`Content-Disposition`）”，请用 `-OJ`：
+  - 新版 curl 可用：`-OJ --output-dir /path/to/save`
+  - 若你的 curl 不支持 `--output-dir`，请先 `cd /path/to/save` 再执行 `-OJ`
 
 ### Single file
 
@@ -140,10 +147,16 @@ TOKEN="$(grep '^API_TOKEN=' .env | cut -d= -f2-)"
 curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
   -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/demo.jpg" \
-  -F "quality=75" \
-  -F "targetFormat=keep" \
-  -F "output=image" \
   -o /path/to/save/demo_compressed.jpg
+```
+
+只指定目录（推荐）：
+
+```bash
+curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -F "files=@/path/to/demo.jpg" \
+  -OJ --output-dir /path/to/save
 ```
 
 ### Multiple files (ZIP)
@@ -153,9 +166,6 @@ curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
   -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/a.jpg" \
   -F "files=@/path/to/b.png" \
-  -F "quality=72" \
-  -F "targetFormat=webp" \
-  -F "output=zip" \
   -F "zipName=my_batch" \
   -o my_batch.zip
 ```
@@ -179,8 +189,9 @@ npm run check && npm run build
 手动验证场景：
 
 - 无 `Authorization` / Token 错误（应返回 `401`）
-- `quality` 非法（应返回 `400`）
+- 传入旧参数 `quality/targetFormat/output`（应返回 `400`）
 - 上传非 `jpg/png/webp`（应返回 `415`）
+- 上传不支持或不可解码的文件（可能返回 `415` 或 `422`）
 - 单图输出（返回图片二进制）
 - 多图输出（返回 ZIP）
 - 总大小超限（应返回 `413`）
@@ -205,6 +216,7 @@ npm run check && npm run build
 │   └── server.ts            # Fastify 启动入口
 ├── Dockerfile
 ├── README.md
+├── openapi.yaml
 ├── package.json
 ├── package-lock.json
 └── tsconfig.json
