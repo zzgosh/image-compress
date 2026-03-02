@@ -198,11 +198,12 @@ npm run check && npm run build
 
 ## Directory Structure
 
+说明：
+
+- `docs/`：本地文档目录，默认已在 `.gitignore` 中忽略，不会提交到仓库。
+
 ```text
 .
-├── docs
-│   └── plan
-│       └── image-compress-api-vps.md  # 迁移实施进度与决策记录
 ├── src
 │   ├── lib
 │   │   ├── auth.ts          # Bearer Token 鉴权
