@@ -5,36 +5,65 @@
 ## Features
 
 - `POST /api/v1/compress`，`multipart/form-data` 上传
-- Bearer Token 鉴权
-- 单图返回图片、多图返回 ZIP
+- Bearer Token 鉴权（单一共享 Token）
+- 单图返回图片、多图自动返回 ZIP
 - 可选输出格式：`keep|jpg|png|webp`
 - `targetFormat=keep` 时启用“压缩变大回退原图”
-- 中等限制默认值：单图 `20MB`、最多 `30` 张、总计 `80MB`
+- 默认限制：单图 `20MB`、最多 `30` 张、总计 `80MB`
 
-## Directory Structure
+## Quick Start (Local)
 
-```text
-.
-├── docs
-│   └── plan
-│       └── image-compress-api-vps.md  # 迁移实施进度与决策记录
-├── src
-│   ├── lib
-│   │   ├── auth.ts          # Bearer Token 鉴权
-│   │   ├── compress.ts      # Sharp 压缩与格式转换
-│   │   ├── validate.ts      # 参数校验与上传限制
-│   │   └── zip.ts           # ZIP 流式打包
-│   ├── routes
-│   │   └── compress.ts      # /api/v1/compress 路由
-│   ├── types
-│   │   └── api.ts           # API 类型与错误模型
-│   └── server.ts            # Fastify 启动入口
-├── Dockerfile
-├── .gitignore
-├── package.json
-├── package-lock.json
-└── tsconfig.json
+### 1) 安装依赖
+
+```bash
+npm install
 ```
+
+### 2) 创建 `.env`
+
+先生成 Token：
+
+```bash
+openssl rand -hex 32
+```
+
+再写入 `.env`（替换为你自己的值）：
+
+```bash
+cat > .env <<'EOF'
+API_TOKEN=replace_me_with_a_random_token
+PORT=3001
+HOST=0.0.0.0
+EOF
+```
+
+### 3) 类型检查 + 构建 + 启动
+
+```bash
+npm run check
+npm run build
+npm run dev
+```
+
+说明：
+
+- `npm run dev` 会自动读取 `.env`
+- 默认监听 `http://0.0.0.0:3001`
+- 退出开发服务：`Ctrl+C`
+
+### 4) 健康检查
+
+```bash
+curl http://127.0.0.1:3001/healthz
+```
+
+## Environment Variables
+
+| Name        | Required | Default   | Description                               |
+| ----------- | -------- | --------- | ----------------------------------------- |
+| `API_TOKEN` | Yes      | -         | Bearer 鉴权密钥，服务启动时必填            |
+| `PORT`      | No       | `3001`    | 服务监听端口                              |
+| `HOST`      | No       | `0.0.0.0` | 服务监听地址                              |
 
 ## API Contract
 
@@ -45,6 +74,10 @@
 ### Headers
 
 - `Authorization: Bearer <token>`
+
+### Content-Type
+
+- `multipart/form-data`
 
 ### Form Fields
 
@@ -57,7 +90,9 @@
 ### Response Rules
 
 - Single file + `output=auto|image` => image binary
-- Multiple files or `output=zip` => `application/zip`
+- Multiple files => `application/zip` (even if `output=image`)
+- `output=zip` => `application/zip`
+- 输出文件名默认基于原文件名追加 `_compressed` 后缀（例如 `a.png` => `a_compressed.png`）
 
 ### Response Headers
 
@@ -85,36 +120,37 @@
 - `422 PROCESSING_FAILED`
 - `500 INTERNAL_ERROR`
 
-## Local Development
+## cURL Examples
+
+建议先从 `.env` 读 Token：
 
 ```bash
-npm install
-npm run check
-npm run build
-API_TOKEN=replace_me npm run dev
+TOKEN="$(grep '^API_TOKEN=' .env | cut -d= -f2-)"
 ```
 
-服务默认监听 `0.0.0.0:3001`，健康检查：`GET /healthz`。
+关于保存/导出位置：
 
-## cURL Examples
+- API 服务只返回二进制响应，不会写入你的本地磁盘或 VPS 的固定目录
+- 保存到哪里由客户端决定（`curl`、网页前端、Shortcuts）
+- `curl -o xx.jpg` 会保存到当前命令执行目录（或你写的绝对路径）
 
 ### Single file
 
 ```bash
 curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
-  -H "Authorization: Bearer replace_me" \
+  -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/demo.jpg" \
   -F "quality=75" \
   -F "targetFormat=keep" \
   -F "output=image" \
-  -o compressed.jpg
+  -o /path/to/save/demo_compressed.jpg
 ```
 
 ### Multiple files (ZIP)
 
 ```bash
 curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
-  -H "Authorization: Bearer replace_me" \
+  -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/a.jpg" \
   -F "files=@/path/to/b.png" \
   -F "quality=72" \
@@ -124,52 +160,52 @@ curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
   -o my_batch.zip
 ```
 
-## Docker
+### Auth failure (expect 401)
 
 ```bash
-npm install
-docker build -t image-compress-api:local .
-docker run --rm -p 3001:3001 -e API_TOKEN=replace_me image-compress-api:local
+curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
+  -H "Authorization: Bearer wrong_token" \
+  -F "files=@/path/to/demo.jpg"
 ```
 
-## Deployment Snippets
+## Testing Checklist
 
-### Docker Compose service
+当前仓库未接入 Jest/Vitest，建议按下面顺序做回归：
 
-```yaml
-image-compress-api:
-  build:
-    context: /path/to/image-compress-api
-  container_name: image-compress-api
-  environment:
-    - NODE_ENV=production
-    - TZ=Asia/Shanghai
-    - API_TOKEN=${IMAGE_COMPRESS_API_TOKEN}
-    - PORT=3001
-  expose:
-    - "3001"
-  networks:
-    - webnet
-  healthcheck:
-    test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/healthz || exit 1"]
-    interval: 30s
-    timeout: 5s
-    retries: 3
-  restart: unless-stopped
+```bash
+npm run check && npm run build
 ```
 
-### Nginx (`zzg.sh` server block)
+手动验证场景：
 
-```nginx
-client_max_body_size 90m;
+- 无 `Authorization` / Token 错误（应返回 `401`）
+- `quality` 非法（应返回 `400`）
+- 上传非 `jpg/png/webp`（应返回 `415`）
+- 单图输出（返回图片二进制）
+- 多图输出（返回 ZIP）
+- 总大小超限（应返回 `413`）
 
-location /api/ {
-    proxy_pass http://image-compress-api:3001;
-    proxy_http_version 1.1;
-    proxy_read_timeout 120s;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-}
+## Directory Structure
+
+```text
+.
+├── docs
+│   └── plan
+│       └── image-compress-api-vps.md  # 迁移实施进度与决策记录
+├── src
+│   ├── lib
+│   │   ├── auth.ts          # Bearer Token 鉴权
+│   │   ├── compress.ts      # Sharp 压缩与格式转换
+│   │   ├── validate.ts      # 参数校验与上传限制
+│   │   └── zip.ts           # ZIP 流式打包
+│   ├── routes
+│   │   └── compress.ts      # /api/v1/compress 路由
+│   ├── types
+│   │   └── api.ts           # API 类型与错误模型
+│   └── server.ts            # Fastify 启动入口
+├── Dockerfile
+├── README.md
+├── package.json
+├── package-lock.json
+└── tsconfig.json
 ```

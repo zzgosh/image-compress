@@ -19,6 +19,7 @@ const SHARP_FORMAT_TO_TARGET: Record<string, Exclude<TargetFormat, 'keep'> | und
   png: 'png',
   webp: 'webp'
 }
+const OUTPUT_NAME_SUFFIX = '_compressed'
 
 const splitFileName = (fileName: string): { baseName: string; extension: string } => {
   const lastDotIndex = fileName.lastIndexOf('.')
@@ -33,17 +34,14 @@ const splitFileName = (fileName: string): { baseName: string; extension: string 
 }
 
 const buildOutputFileName = (sourceFileName: string, format: Exclude<TargetFormat, 'keep'>, forceTargetFormat: boolean): string => {
-  const extension = OUTPUT_FORMAT_TO_EXTENSION[format]
-  if (!forceTargetFormat) {
-    const parts = splitFileName(sourceFileName)
-    if (parts.extension) {
-      return sourceFileName
-    }
-    return `${parts.baseName}.${extension}`
+  const parts = splitFileName(sourceFileName)
+  const normalizedBase = parts.baseName.endsWith(OUTPUT_NAME_SUFFIX) ? parts.baseName : `${parts.baseName}${OUTPUT_NAME_SUFFIX}`
+
+  if (!forceTargetFormat && parts.extension) {
+    return `${normalizedBase}.${parts.extension}`
   }
 
-  const parts = splitFileName(sourceFileName)
-  return `${parts.baseName}.${extension}`
+  return `${normalizedBase}.${OUTPUT_FORMAT_TO_EXTENSION[format]}`
 }
 
 const encodeImage = async (inputBuffer: Buffer, format: Exclude<TargetFormat, 'keep'>, quality: number): Promise<Buffer> => {
