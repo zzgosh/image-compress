@@ -5,10 +5,11 @@ import { HttpError } from './types/api.js'
 
 const port = Number.parseInt(process.env.PORT ?? '3001', 10)
 const host = process.env.HOST ?? '0.0.0.0'
-const apiToken = process.env.API_TOKEN?.trim()
+const apiToken = process.env.IMAGE_COMPRESS_API_TOKEN?.trim()
+const apiBasePath = '/api/image-compress'
 
 if (!apiToken) {
-  throw new Error('API_TOKEN is required')
+  throw new Error('缺少必填环境变量：IMAGE_COMPRESS_API_TOKEN')
 }
 
 const app = Fastify({
@@ -22,7 +23,11 @@ app.get('/healthz', async () => {
   return { status: 'ok' }
 })
 
-app.register(compressRoutes, { apiToken })
+app.get(`${apiBasePath}/healthz`, async () => {
+  return { status: 'ok' }
+})
+
+app.register(compressRoutes, { apiToken, prefix: apiBasePath })
 
 app.setErrorHandler((error, request, reply) => {
   if (error instanceof HttpError) {
@@ -60,6 +65,24 @@ app.setErrorHandler((error, request, reply) => {
 const start = async (): Promise<void> => {
   try {
     await app.listen({ port, host })
+
+    let isClosing = false
+    const close = async (signal: NodeJS.Signals): Promise<void> => {
+      if (isClosing) return
+      isClosing = true
+
+      app.log.info({ signal }, 'received shutdown signal')
+      try {
+        await app.close()
+        process.exit(0)
+      } catch (error) {
+        app.log.error(error, 'failed to close server')
+        process.exit(1)
+      }
+    }
+
+    process.on('SIGINT', () => void close('SIGINT'))
+    process.on('SIGTERM', () => void close('SIGTERM'))
   } catch (error) {
     app.log.error(error, 'failed to start service')
     process.exit(1)

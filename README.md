@@ -2,7 +2,7 @@
 
 ## Features
 
-- `POST /api/v1/compress`，`multipart/form-data` 上传
+- `POST /api/image-compress/v1/compress`，`multipart/form-data` 上传
 - Bearer Token 鉴权（单一共享 Token）
 - 单图返回图片、多图自动返回 ZIP
 - 输出格式与输入格式保持一致（不支持转换输出格式）
@@ -34,7 +34,7 @@ openssl rand -hex 32
 
 ```bash
 cat > .env <<'EOF'
-API_TOKEN=replace_me_with_a_random_token
+IMAGE_COMPRESS_API_TOKEN=replace_me_with_a_random_token
 PORT=3001
 HOST=0.0.0.0
 EOF
@@ -60,11 +60,37 @@ npm run dev
 curl http://127.0.0.1:3001/healthz
 ```
 
+## Quick Start (Docker)
+
+构建镜像：
+
+```bash
+docker build -t image-compress-api:local .
+```
+
+启动容器（示例：把服务映射到本机 3001 端口）：
+
+```bash
+docker run --rm -p 3001:3001 \
+  -e IMAGE_COMPRESS_API_TOKEN=replace_me_with_a_random_token \
+  image-compress-api:local
+```
+
+说明：
+
+- 生产环境更推荐用 Docker Compose，并且不要把后端端口直接暴露到公网（交给 Nginx 反代）
+- 如果你已经有 `.env`，也可以用 `--env-file .env` 传入（注意 `.env` 不要提交到仓库）
+
+## 部署注意事项（通用）
+
+- 建议把服务放在反向代理（如 Nginx）之后，不要把容器端口直接暴露到公网。
+- 如果使用 Nginx 反代，需要把 `client_max_body_size` 调到不小于 **90m**（服务侧默认总上传上限 80MB）。
+
 ## Environment Variables
 
 | Name        | Required | Default   | Description                               |
 | ----------- | -------- | --------- | ----------------------------------------- |
-| `API_TOKEN` | Yes      | -         | Bearer 鉴权密钥，服务启动时必填            |
+| `IMAGE_COMPRESS_API_TOKEN` | Yes      | -         | Bearer 鉴权密钥，服务启动时必填            |
 | `PORT`      | No       | `3001`    | 服务监听端口                              |
 | `HOST`      | No       | `0.0.0.0` | 服务监听地址                              |
 
@@ -74,7 +100,7 @@ curl http://127.0.0.1:3001/healthz
 
 ### Endpoint
 
-`POST /api/v1/compress`
+`POST /api/image-compress/v1/compress`
 
 ### Headers
 
@@ -127,7 +153,7 @@ curl http://127.0.0.1:3001/healthz
 建议先从 `.env` 读 Token：
 
 ```bash
-TOKEN="$(grep '^API_TOKEN=' .env | cut -d= -f2-)"
+TOKEN="$(grep '^IMAGE_COMPRESS_API_TOKEN=' .env | cut -d= -f2-)"
 ```
 
 关于保存/导出位置：
@@ -142,7 +168,7 @@ TOKEN="$(grep '^API_TOKEN=' .env | cut -d= -f2-)"
 ### Single file
 
 ```bash
-curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
+curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
   -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/demo.jpg" \
   -o /path/to/save/demo_compressed.jpg
@@ -151,7 +177,7 @@ curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
 只指定目录（推荐）：
 
 ```bash
-curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
+curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
   -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/demo.jpg" \
   -OJ --output-dir /path/to/save
@@ -160,7 +186,7 @@ curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
 ### Multiple files (ZIP)
 
 ```bash
-curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
+curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
   -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/a.jpg" \
   -F "files=@/path/to/b.png" \
@@ -171,7 +197,7 @@ curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
 ### Auth failure (expect 401)
 
 ```bash
-curl -X POST "http://127.0.0.1:3001/api/v1/compress" \
+curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
   -H "Authorization: Bearer wrong_token" \
   -F "files=@/path/to/demo.jpg"
 ```
@@ -202,6 +228,10 @@ npm run check && npm run build
 
 ```text
 .
+├── .github
+│   └── workflows
+│       ├── ci.yml            # GitHub Actions：类型检查与构建
+│       └── deploy.yml         # GitHub Actions：构建并推送镜像（GHCR）
 ├── src
 │   ├── lib
 │   │   ├── auth.ts          # Bearer Token 鉴权
@@ -209,10 +239,12 @@ npm run check && npm run build
 │   │   ├── validate.ts      # 参数校验与上传限制
 │   │   └── zip.ts           # ZIP 流式打包
 │   ├── routes
-│   │   └── compress.ts      # /api/v1/compress 路由
+│   │   └── compress.ts      # /api/image-compress/v1/compress 路由
 │   ├── types
 │   │   └── api.ts           # API 类型与错误模型
 │   └── server.ts            # Fastify 启动入口
+├── .dockerignore
+├── .env.example
 ├── Dockerfile
 ├── README.md
 ├── openapi.yaml

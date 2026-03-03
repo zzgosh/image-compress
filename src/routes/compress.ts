@@ -35,7 +35,7 @@ const drainReadable = async (stream: NodeJS.ReadableStream): Promise<void> => {
 }
 
 const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, options) => {
-  app.post('/api/v1/compress', async (request, reply) => {
+  app.post('/v1/compress', async (request, reply) => {
     assertAuthorized(request.headers.authorization, options.apiToken)
 
     if (!request.isMultipart()) {
