@@ -1,7 +1,5 @@
 # Image Compress API
 
-面向 VPS + Docker + Nginx 的图片压缩服务，支持 `jpg/png/webp` 输入。压缩参数在服务端固定配置，不通过 API 暴露可调参数，以降低使用与维护成本。
-
 ## Features
 
 - `POST /api/v1/compress`，`multipart/form-data` 上传
