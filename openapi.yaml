@@ -38,7 +38,27 @@ paths:
                 required:
                   - status
 
-  /api/v1/compress:
+  /api/image-compress/healthz:
+    get:
+      tags:
+        - health
+      summary: Health check (prefixed)
+      operationId: imageCompressHealthz
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                required:
+                  - status
+
+  /api/image-compress/v1/compress:
     post:
       tags:
         - compress
