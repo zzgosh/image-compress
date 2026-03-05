@@ -14,7 +14,7 @@ const splitFileName = (fileName: string): { baseName: string; extension: string 
   }
 }
 
-const withUniqueNames = (files: CompressedImageResult[]): CompressedImageResult[] => {
+export const withUniqueZipEntryNames = (files: CompressedImageResult[]): CompressedImageResult[] => {
   const counter = new Map<string, number>()
 
   return files.map((file) => {
@@ -45,7 +45,7 @@ export const createZipStream = (files: CompressedImageResult[]): NodeJS.Readable
   })
 
   archive.pipe(passthrough)
-  for (const file of withUniqueNames(files)) {
+  for (const file of withUniqueZipEntryNames(files)) {
     archive.append(file.buffer, { name: file.fileName })
   }
 

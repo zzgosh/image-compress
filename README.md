@@ -3,8 +3,11 @@
 ## Features
 
 - `POST /api/image-compress/v1/compress`，`multipart/form-data` 上传
+- 显式 `responseMode`：
+  - `metadata`（默认）：只返回结构化 JSON 元信息（不返回文件本体），适合 Shortcuts/脚本/Agent 做 if/else 分支判断
+  - `binary`：直接返回二进制（单图或 ZIP），适合最终下载/保存
 - Bearer Token 鉴权（支持多 Token，任一命中即可）
-- 单图返回图片、多图自动返回 ZIP
+- `binary` 模式：单图返回图片、多图自动返回 ZIP
 - 输出格式与输入格式保持一致（不支持转换输出格式）
 - 输入格式以文件内容检测为准（不以扩展名/MIME 为准；重命名不等于转格式）
 - JPEG 文件名兼容：若上传文件名为 `.jpeg`，输出也使用 `.jpeg` 扩展名（内容仍为 `image/jpeg`）
@@ -108,6 +111,12 @@ Token 使用建议：
 
 `POST /api/image-compress/v1/compress`
 
+### Query Params
+
+- `responseMode` (optional, default: `metadata`)
+  - `metadata`：只返回 JSON 元信息（不返回文件本体）
+  - `binary`：返回二进制文件流（单图或 ZIP）
+
 ### Headers
 
 - `Authorization: Bearer <token>`
@@ -119,20 +128,63 @@ Token 使用建议：
 ### Form Fields
 
 - `files` (required, repeatable)
+- `responseMode` (optional, same as query param; if both provided, they must match)
 - `zipName` (optional, filename for ZIP response)
 - Other fields are not supported and will return `400 INVALID_ARGUMENT`.
 
 ### Response Rules
 
-- Single file => image binary (same format as input)
-- Multiple files => `application/zip`
-- 输出文件名默认基于原文件名追加 `_compressed` 后缀（例如 `a.png` => `a_compressed.png`）
+- `responseMode=metadata`（默认）
+  - `200` 返回 JSON（稳定的业务字段，适合自动化做 if/else）
+  - **`200` 不等于一定压缩变小**：请显式判断 `compressed` / `outcome`
+- `responseMode=binary`
+  - 单图返回图片二进制（与输入格式一致）
+  - 多图返回 `application/zip`
+  - 输出文件名默认基于原文件名追加 `_compressed` 后缀（例如 `a.png` => `a_compressed.png`）
+  - 若再编码后不更小，则回退原图（并保持原文件名）
 
 ### Response Headers
 
-- `X-Original-Bytes`
-- `X-Compressed-Bytes`
-- `X-Compression-Ratio`
+> 仅 `responseMode=binary` 返回（辅助信息，不建议作为主要业务分支依据；自动化请优先用 `metadata` 模式的 JSON 字段）。
+
+- `X-Original-Bytes`（输入总字节数）
+- `X-Compressed-Bytes`（输出图片总字节数；ZIP 场景不包含容器开销）
+- `X-Compression-Ratio`（节省百分比，保留 2 位小数）
+- `X-Compressed`（`true`/`false`）
+- `X-Outcome`（`compressed`/`fallback_original`）
+
+### Success JSON (`responseMode=metadata`)
+
+`200` 返回结构化 JSON（字段为英文，便于自动化工具稳定判断）：
+
+```json
+{
+  "success": true,
+  "compressed": true,
+  "outcome": "compressed",
+  "originalBytes": 123456,
+  "outputBytes": 78901,
+  "savedBytes": 44555,
+  "compressionRatio": 0.3606,
+  "outputType": "single",
+  "outputMimeType": "image/jpeg",
+  "outputFileName": "demo_compressed.jpeg",
+  "fileCount": 1,
+  "results": [
+    {
+      "originalFileName": "demo.jpeg",
+      "outputFileName": "demo_compressed.jpeg",
+      "outputMimeType": "image/jpeg",
+      "compressed": true,
+      "outcome": "compressed",
+      "originalBytes": 123456,
+      "outputBytes": 78901,
+      "savedBytes": 44555,
+      "compressionRatio": 0.3606
+    }
+  ]
+}
+```
 
 ### Error JSON
 
@@ -164,17 +216,26 @@ TOKEN="$(grep '^IMAGE_COMPRESS_API_TOKENS=' .env | cut -d= -f2- | cut -d, -f1)"
 
 关于保存/导出位置：
 
-- API 服务只返回二进制响应，不会写入你的本地磁盘或 VPS 的固定目录
+- API 服务是无状态的：不会在 VPS 上持久化保存图片/ZIP 产物，也不会返回 `downloadUrl`
+- `metadata` 模式返回 JSON；`binary` 模式返回二进制文件流
 - 保存到哪里由客户端决定（`curl`、网页前端、Shortcuts）
 - `curl -o /path/to/save/out.jpg` 是指定“输出文件路径 + 文件名”，不是只指定目录
 - 如果你希望“只指定保存目录，并使用服务端返回的文件名（`Content-Disposition`）”，请用 `-OJ`：
   - 新版 curl 可用：`-OJ --output-dir /path/to/save`
   - 若你的 curl 不支持 `--output-dir`，请先 `cd /path/to/save` 再执行 `-OJ`
 
-### Single file
+### Metadata (single file)
 
 ```bash
-curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
+curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress?responseMode=metadata" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -F "files=@/path/to/demo.jpg"
+```
+
+### Binary (single file)
+
+```bash
+curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress?responseMode=binary" \
   -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/demo.jpg" \
   -o /path/to/save/demo_compressed.jpg
@@ -183,16 +244,16 @@ curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
 只指定目录（推荐）：
 
 ```bash
-curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
+curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress?responseMode=binary" \
   -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/demo.jpg" \
   -OJ --output-dir /path/to/save
 ```
 
-### Multiple files (ZIP)
+### Binary (multiple files => ZIP)
 
 ```bash
-curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
+curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress?responseMode=binary" \
   -H "Authorization: Bearer ${TOKEN}" \
   -F "files=@/path/to/a.jpg" \
   -F "files=@/path/to/b.png" \
@@ -223,8 +284,8 @@ npm run check && npm run build
 - 传入旧参数 `quality/targetFormat/output`（应返回 `400`）
 - 上传非 `jpg/png/webp`（应返回 `415`）
 - 上传不支持或不可解码的文件（可能返回 `415` 或 `422`）
-- 单图输出（返回图片二进制）
-- 多图输出（返回 ZIP）
+- `responseMode=metadata`（默认）：返回 JSON；覆盖 `compressed` 与 `fallback_original` 两种业务结果
+- `responseMode=binary`：单图返回图片二进制、多图返回 ZIP；并检查 `Content-Disposition` 与辅助 headers
 - 总大小超限（应返回 `413`）
 
 ## Directory Structure

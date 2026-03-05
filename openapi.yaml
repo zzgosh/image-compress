@@ -6,6 +6,9 @@ info:
     Image compression API designed for VPS deployment.
 
     Notes:
+    - The service is stateless: it does not persist outputs and never returns a `downloadUrl`.
+    - Use `responseMode=metadata` (default) to get JSON metadata only, suitable for automation if/else branching.
+    - Use `responseMode=binary` to stream the final output (single image or ZIP).
     - Output format always matches the detected input format (JPEG/PNG/WebP). Format conversion is not supported.
     - Input format is detected from file bytes (not file extension nor multipart content-type).
     - Compression settings are fixed server-side (no request parameters for tuning).
@@ -64,8 +67,25 @@ paths:
         - compress
       summary: Compress uploaded images
       operationId: compressImages
+      description: |
+        This endpoint supports two explicit response modes via `responseMode`:
+
+        - `metadata` (default): returns structured JSON metadata only (no binary file in the response body).
+        - `binary`: streams the final binary output (single image or ZIP).
+
+        HTTP 200 means the request was processed successfully, but **does not** guarantee the output is smaller.
+        In `metadata` mode, always branch on `compressed` / `outcome`.
       security:
         - bearerAuth: []
+      parameters:
+        - in: query
+          name: responseMode
+          required: false
+          schema:
+            $ref: '#/components/schemas/CompressResponseMode'
+          description: |
+            Controls the success response shape.
+            If also provided in the multipart form field `responseMode`, the two values must match.
       requestBody:
         required: true
         content:
@@ -73,6 +93,9 @@ paths:
             schema:
               type: object
               properties:
+                responseMode:
+                  description: Alternative to the `responseMode` query parameter.
+                  $ref: '#/components/schemas/CompressResponseMode'
                 files:
                   description: One or more images to compress.
                   type: array
@@ -87,28 +110,46 @@ paths:
                 - files
       responses:
         '200':
-          description: Compressed output (single image or ZIP for multiple images).
+          description: |
+            Success response.
+
+            - `responseMode=metadata` => `application/json` (structured metadata)
+            - `responseMode=binary` => binary stream (single image or ZIP)
           headers:
             X-Original-Bytes:
               schema:
                 type: string
-              description: Sum of original input bytes.
+              description: Sum of original input bytes (binary mode only).
               example: '123456'
             X-Compressed-Bytes:
               schema:
                 type: string
-              description: Sum of output bytes.
+              description: Sum of output image bytes (binary mode only; excludes ZIP container overhead).
               example: '78901'
             X-Compression-Ratio:
               schema:
                 type: string
-              description: Percentage saved, formatted with 2 decimals.
+              description: Percentage saved, formatted with 2 decimals (binary mode only).
               example: '36.12'
+            X-Compressed:
+              schema:
+                type: string
+                enum:
+                  - 'true'
+                  - 'false'
+              description: Whether `X-Compressed-Bytes` is smaller than `X-Original-Bytes` (binary mode only).
+            X-Outcome:
+              schema:
+                $ref: '#/components/schemas/CompressOutcome'
+              description: Business outcome derived from the byte comparison (binary mode only).
             Content-Disposition:
               schema:
                 type: string
-              description: Attachment filename for the output.
+              description: Attachment filename for the output (binary mode only).
           content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompressMetadataResponse'
             image/jpeg:
               schema:
                 type: string
@@ -194,3 +235,178 @@ components:
             - message
       required:
         - error
+    CompressResponseMode:
+      type: string
+      enum:
+        - metadata
+        - binary
+      default: metadata
+      description: Controls the success response shape.
+    CompressOutcome:
+      type: string
+      enum:
+        - compressed
+        - fallback_original
+      description: |
+        Business outcome for a successful request.
+        `fallback_original` means re-encoding did not reduce bytes, so the service returns the original bytes.
+    CompressOutputType:
+      type: string
+      enum:
+        - single
+        - zip
+    CompressMetadataFileResult:
+      type: object
+      properties:
+        originalFileName:
+          type: string
+        outputFileName:
+          type: string
+        outputMimeType:
+          type: string
+          description: MIME type of the output image bytes for this file.
+        compressed:
+          type: boolean
+          description: Whether `outputBytes` is smaller than `originalBytes` for this file.
+        outcome:
+          $ref: '#/components/schemas/CompressOutcome'
+        reason:
+          type: string
+          description: Present only when `outcome=fallback_original`.
+          example: reencoded_not_smaller
+        originalBytes:
+          type: integer
+          format: int64
+        outputBytes:
+          type: integer
+          format: int64
+        savedBytes:
+          type: integer
+          format: int64
+        compressionRatio:
+          type: number
+          format: float
+          description: Bytes saved ratio for this file (`savedBytes / originalBytes`).
+      required:
+        - originalFileName
+        - outputFileName
+        - outputMimeType
+        - compressed
+        - outcome
+        - originalBytes
+        - outputBytes
+        - savedBytes
+        - compressionRatio
+    CompressMetadataBase:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        compressed:
+          type: boolean
+          description: Whether total `outputBytes` is smaller than total `originalBytes`.
+        outcome:
+          $ref: '#/components/schemas/CompressOutcome'
+        reason:
+          type: string
+          description: Present only when `outcome=fallback_original` (i.e., no bytes were saved overall).
+          example: reencoded_not_smaller
+        originalBytes:
+          type: integer
+          format: int64
+          description: Sum of original input bytes.
+        outputBytes:
+          type: integer
+          format: int64
+          description: |
+            Sum of output image bytes (excludes ZIP container overhead when `outputType=zip`).
+        savedBytes:
+          type: integer
+          format: int64
+        compressionRatio:
+          type: number
+          format: float
+          description: Bytes saved ratio (`savedBytes / originalBytes`).
+        outputType:
+          $ref: '#/components/schemas/CompressOutputType'
+        outputMimeType:
+          type: string
+          description: MIME type for the binary output when `responseMode=binary`.
+        outputFileName:
+          type: string
+          description: Filename for the binary output when `responseMode=binary`.
+        fileCount:
+          type: integer
+          minimum: 1
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/CompressMetadataFileResult'
+      required:
+        - success
+        - compressed
+        - outcome
+        - originalBytes
+        - outputBytes
+        - savedBytes
+        - compressionRatio
+        - outputType
+        - outputMimeType
+        - outputFileName
+        - fileCount
+        - results
+    CompressMetadataSingleResponse:
+      allOf:
+        - $ref: '#/components/schemas/CompressMetadataBase'
+        - type: object
+          properties:
+            outputType:
+              type: string
+              enum:
+                - single
+            outputMimeType:
+              type: string
+              enum:
+                - image/jpeg
+                - image/png
+                - image/webp
+            fileCount:
+              type: integer
+              enum:
+                - 1
+            results:
+              type: array
+              minItems: 1
+              maxItems: 1
+    CompressMetadataZipResponse:
+      allOf:
+        - $ref: '#/components/schemas/CompressMetadataBase'
+        - type: object
+          properties:
+            outputType:
+              type: string
+              enum:
+                - zip
+            outputMimeType:
+              type: string
+              enum:
+                - application/zip
+            outputFileName:
+              type: string
+              pattern: '.*\\.zip$'
+            fileCount:
+              type: integer
+              minimum: 2
+            results:
+              type: array
+              minItems: 2
+    CompressMetadataResponse:
+      oneOf:
+        - $ref: '#/components/schemas/CompressMetadataSingleResponse'
+        - $ref: '#/components/schemas/CompressMetadataZipResponse'
+      discriminator:
+        propertyName: outputType
+        mapping:
+          single: '#/components/schemas/CompressMetadataSingleResponse'
+          zip: '#/components/schemas/CompressMetadataZipResponse'
