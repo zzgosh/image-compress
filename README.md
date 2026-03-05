@@ -3,7 +3,7 @@
 ## Features
 
 - `POST /api/image-compress/v1/compress`，`multipart/form-data` 上传
-- Bearer Token 鉴权（单一共享 Token）
+- Bearer Token 鉴权（支持多 Token，任一命中即可）
 - 单图返回图片、多图自动返回 ZIP
 - 输出格式与输入格式保持一致（不支持转换输出格式）
 - 输入格式以文件内容检测为准（不以扩展名/MIME 为准；重命名不等于转格式）
@@ -24,17 +24,18 @@ npm install
 
 ### 2) 创建 `.env`
 
-先生成 Token：
+先生成两个 Token（你也可以按需生成更多）：
 
 ```bash
-openssl rand -hex 32
+TOKEN_1="$(openssl rand -hex 32)"
+TOKEN_2="$(openssl rand -hex 32)"
 ```
 
 再写入 `.env`（替换为你自己的值）：
 
 ```bash
 cat > .env <<'EOF'
-IMAGE_COMPRESS_API_TOKEN=replace_me_with_a_random_token
+IMAGE_COMPRESS_API_TOKENS=replace_me_with_a_random_token_1,replace_me_with_a_random_token_2
 PORT=3001
 HOST=0.0.0.0
 EOF
@@ -72,7 +73,7 @@ docker build -t image-compress-api:local .
 
 ```bash
 docker run --rm -p 3001:3001 \
-  -e IMAGE_COMPRESS_API_TOKEN=replace_me_with_a_random_token \
+  -e IMAGE_COMPRESS_API_TOKENS=replace_me_with_a_random_token_1,replace_me_with_a_random_token_2 \
   image-compress-api:local
 ```
 
@@ -90,9 +91,14 @@ docker run --rm -p 3001:3001 \
 
 | Name        | Required | Default   | Description                               |
 | ----------- | -------- | --------- | ----------------------------------------- |
-| `IMAGE_COMPRESS_API_TOKEN` | Yes      | -         | Bearer 鉴权密钥，服务启动时必填            |
+| `IMAGE_COMPRESS_API_TOKENS` | Yes      | -         | Bearer 鉴权密钥列表（逗号分隔，服务启动时必填） |
 | `PORT`      | No       | `3001`    | 服务监听端口                              |
 | `HOST`      | No       | `0.0.0.0` | 服务监听地址                              |
+
+Token 使用建议：
+
+- 按调用方分配独立 Token，避免多人共享同一个密钥
+- 某个 Token 泄露时，只撤销该 Token，不影响其他调用方
 
 ## API Contract
 
@@ -150,10 +156,10 @@ docker run --rm -p 3001:3001 \
 
 ## cURL Examples
 
-建议先从 `.env` 读 Token：
+建议先从 `.env` 读取第一个 Token 用于本地调试：
 
 ```bash
-TOKEN="$(grep '^IMAGE_COMPRESS_API_TOKEN=' .env | cut -d= -f2-)"
+TOKEN="$(grep '^IMAGE_COMPRESS_API_TOKENS=' .env | cut -d= -f2- | cut -d, -f1)"
 ```
 
 关于保存/导出位置：
@@ -213,6 +219,7 @@ npm run check && npm run build
 手动验证场景：
 
 - 无 `Authorization` / Token 错误（应返回 `401`）
+- 使用列表中的不同合法 Token 调用（都应返回 `200`）
 - 传入旧参数 `quality/targetFormat/output`（应返回 `400`）
 - 上传非 `jpg/png/webp`（应返回 `415`）
 - 上传不支持或不可解码的文件（可能返回 `415` 或 `422`）
@@ -224,7 +231,7 @@ npm run check && npm run build
 
 说明：
 
-- `docs/`：本地文档目录，默认已在 `.gitignore` 中忽略，不会提交到仓库。
+- `local-docs/`：本地进度与临时文档目录，默认已在 `.gitignore` 中忽略，不会提交到仓库。
 
 ```text
 .
@@ -232,10 +239,11 @@ npm run check && npm run build
 │   └── workflows
 │       ├── ci.yml            # GitHub Actions：类型检查与构建
 │       └── deploy.yml         # GitHub Actions：构建并推送镜像（GHCR）
+├── local-docs                # 本地文档（不提交）
 ├── src
 │   ├── lib
-│   │   ├── auth.ts          # Bearer Token 鉴权
-│   │   ├── compress.ts      # Sharp 压缩与格式转换
+│   │   ├── auth.ts          # Bearer Token 鉴权（多 Token）
+│   │   ├── compress.ts      # Sharp 压缩主逻辑
 │   │   ├── validate.ts      # 参数校验与上传限制
 │   │   └── zip.ts           # ZIP 流式打包
 │   ├── routes

@@ -168,6 +168,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: token
+      description: Use one token from the server-side IMAGE_COMPRESS_API_TOKENS list.
   schemas:
     ApiErrorCode:
       type: string

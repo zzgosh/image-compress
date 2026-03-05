@@ -12,7 +12,7 @@ import { createZipStream } from '../lib/zip.js'
 import { HttpError, type UploadedImage } from '../types/api.js'
 
 interface CompressRoutesOptions {
-  apiToken: string
+  apiTokens: string[]
 }
 
 const sumBytes = (values: number[]): number => values.reduce((total, value) => total + value, 0)
@@ -36,7 +36,7 @@ const drainReadable = async (stream: NodeJS.ReadableStream): Promise<void> => {
 
 const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, options) => {
   app.post('/v1/compress', async (request, reply) => {
-    assertAuthorized(request.headers.authorization, options.apiToken)
+    assertAuthorized(request.headers.authorization, options.apiTokens)
 
     if (!request.isMultipart()) {
       throw new HttpError(400, 'INVALID_ARGUMENT', 'content-type must be multipart/form-data')
