@@ -8,12 +8,16 @@ import {
   normalizeZipName,
   sanitizeFileName
 } from '../lib/validate.js'
-import { createZipStream } from '../lib/zip.js'
-import { HttpError, type UploadedImage } from '../types/api.js'
+import { createZipStream, withUniqueZipEntryNames } from '../lib/zip.js'
+import { HttpError, type CompressedImageResult, type UploadedImage } from '../types/api.js'
 
 interface CompressRoutesOptions {
-  apiToken: string
+  apiTokens: string[]
 }
+
+type ResponseMode = 'metadata' | 'binary'
+type CompressOutcome = 'compressed' | 'fallback_original'
+type CompressReason = 'reencoded_not_smaller'
 
 const sumBytes = (values: number[]): number => values.reduce((total, value) => total + value, 0)
 
@@ -22,6 +26,17 @@ const normalizeFieldValue = (value: unknown): string => {
     return value
   }
   return `${value ?? ''}`
+}
+
+const parseResponseMode = (rawValue: string | undefined): ResponseMode | undefined => {
+  if (!rawValue) return undefined
+
+  const normalized = rawValue.trim().toLowerCase()
+  if (normalized === 'metadata' || normalized === 'binary') {
+    return normalized
+  }
+
+  throw new HttpError(400, 'INVALID_ARGUMENT', 'responseMode must be metadata or binary')
 }
 
 const drainReadable = async (stream: NodeJS.ReadableStream): Promise<void> => {
@@ -34,9 +49,31 @@ const drainReadable = async (stream: NodeJS.ReadableStream): Promise<void> => {
   }
 }
 
+const resolveFileOutcome = (
+  file: CompressedImageResult
+): { compressed: boolean; outcome: CompressOutcome; reason?: CompressReason } => {
+  const compressed = !file.usedFallback
+  return {
+    compressed,
+    outcome: compressed ? 'compressed' : 'fallback_original',
+    reason: compressed ? undefined : 'reencoded_not_smaller'
+  }
+}
+
+const resolveResponseOutcome = (
+  files: CompressedImageResult[]
+): { compressed: boolean; outcome: CompressOutcome; reason?: CompressReason } => {
+  const compressed = files.some((file) => !file.usedFallback)
+  return {
+    compressed,
+    outcome: compressed ? 'compressed' : 'fallback_original',
+    reason: compressed ? undefined : 'reencoded_not_smaller'
+  }
+}
+
 const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, options) => {
-  app.post('/v1/compress', async (request, reply) => {
-    assertAuthorized(request.headers.authorization, options.apiToken)
+  app.post<{ Querystring: { responseMode?: string } }>('/v1/compress', async (request, reply) => {
+    assertAuthorized(request.headers.authorization, options.apiTokens)
 
     if (!request.isMultipart()) {
       throw new HttpError(400, 'INVALID_ARGUMENT', 'content-type must be multipart/form-data')
@@ -94,6 +131,11 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
           continue
         }
 
+        if (part.fieldname === 'responseMode') {
+          fields.responseMode = value
+          continue
+        }
+
         if (part.fieldname === 'quality' || part.fieldname === 'targetFormat' || part.fieldname === 'output') {
           firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'quality/targetFormat/output are not supported')
           continue
@@ -111,18 +153,75 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
       throw new HttpError(400, 'INVALID_ARGUMENT', 'files is required')
     }
 
+    const responseModeFromQuery = parseResponseMode(request.query.responseMode)
+    const responseModeFromForm = parseResponseMode(fields.responseMode)
+    if (responseModeFromQuery && responseModeFromForm && responseModeFromQuery !== responseModeFromForm) {
+      throw new HttpError(400, 'INVALID_ARGUMENT', 'responseMode in query and form must match')
+    }
+    const responseMode: ResponseMode = responseModeFromQuery ?? responseModeFromForm ?? 'metadata'
+
     const compressedFiles = await compressImages(files)
+    const outputFiles = compressedFiles.length === 1 ? compressedFiles : withUniqueZipEntryNames(compressedFiles)
 
     const originalBytes = sumBytes(files.map((file) => file.byteLength))
-    const compressedBytes = sumBytes(compressedFiles.map((file) => file.compressedBytes))
-    const ratio = originalBytes > 0 ? ((1 - compressedBytes / originalBytes) * 100).toFixed(2) : '0.00'
+    const outputBytes = sumBytes(compressedFiles.map((file) => file.compressedBytes))
+    const savedBytes = originalBytes - outputBytes
+    const ratio = originalBytes > 0 ? ((savedBytes / originalBytes) * 100).toFixed(2) : '0.00'
+    const compressionRatio = originalBytes > 0 ? savedBytes / originalBytes : 0
+
+    const { compressed, outcome, reason } = resolveResponseOutcome(compressedFiles)
+
+    if (responseMode === 'metadata') {
+      const outputType = outputFiles.length === 1 ? ('single' as const) : ('zip' as const)
+      const outputMimeType = outputType === 'single' ? outputFiles[0]?.outputMimeType : 'application/zip'
+      const outputFileName = outputType === 'single' ? outputFiles[0]?.fileName : normalizeZipName(fields.zipName)
+
+      if (outputType === 'single' && (!outputMimeType || !outputFileName)) {
+        throw new HttpError(500, 'INTERNAL_ERROR', 'compressed output is empty')
+      }
+
+      return reply.send({
+        success: true,
+        compressed,
+        outcome,
+        reason,
+        originalBytes,
+        outputBytes,
+        savedBytes,
+        compressionRatio,
+        outputType,
+        outputMimeType,
+        outputFileName,
+        fileCount: files.length,
+        results: outputFiles.map((file) => {
+          const { compressed: fileCompressed, outcome: fileOutcome, reason: fileReason } = resolveFileOutcome(file)
+          const fileSavedBytes = file.originalBytes - file.compressedBytes
+          const fileCompressionRatio = file.originalBytes > 0 ? fileSavedBytes / file.originalBytes : 0
+
+          return {
+            originalFileName: file.sourceFileName,
+            outputFileName: file.fileName,
+            outputMimeType: file.outputMimeType,
+            compressed: fileCompressed,
+            outcome: fileOutcome,
+            reason: fileReason,
+            originalBytes: file.originalBytes,
+            outputBytes: file.compressedBytes,
+            savedBytes: fileSavedBytes,
+            compressionRatio: fileCompressionRatio
+          }
+        })
+      })
+    }
 
     reply.header('X-Original-Bytes', String(originalBytes))
-    reply.header('X-Compressed-Bytes', String(compressedBytes))
+    reply.header('X-Compressed-Bytes', String(outputBytes))
     reply.header('X-Compression-Ratio', ratio)
+    reply.header('X-Compressed', String(compressed))
+    reply.header('X-Outcome', outcome)
 
-    if (compressedFiles.length === 1) {
-      const file = compressedFiles[0]
+    if (outputFiles.length === 1) {
+      const file = outputFiles[0]
       if (!file) {
         throw new HttpError(500, 'INTERNAL_ERROR', 'compressed output is empty')
       }
@@ -135,7 +234,7 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
     reply.type('application/zip')
     reply.header('Content-Disposition', `attachment; filename="${zipFileName}"`)
 
-    return reply.send(createZipStream(compressedFiles))
+    return reply.send(createZipStream(outputFiles))
   })
 }
 

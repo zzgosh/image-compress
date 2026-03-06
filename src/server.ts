@@ -5,12 +5,22 @@ import { HttpError } from './types/api.js'
 
 const port = Number.parseInt(process.env.PORT ?? '3001', 10)
 const host = process.env.HOST ?? '0.0.0.0'
-const apiToken = process.env.IMAGE_COMPRESS_API_TOKEN?.trim()
 const apiBasePath = '/api/image-compress'
 
-if (!apiToken) {
-  throw new Error('缺少必填环境变量：IMAGE_COMPRESS_API_TOKEN')
+const parseApiTokens = (rawValue: string | undefined): string[] => {
+  if (!rawValue) {
+    throw new Error('缺少必填环境变量：IMAGE_COMPRESS_API_TOKENS')
+  }
+
+  const normalizedItems = rawValue.split(',').map((item) => item.trim())
+  if (normalizedItems.length === 0 || normalizedItems.some((item) => !item)) {
+    throw new Error('环境变量 IMAGE_COMPRESS_API_TOKENS 格式错误：请使用逗号分隔的非空 Token 列表')
+  }
+
+  return [...new Set(normalizedItems)]
 }
+
+const apiTokens = parseApiTokens(process.env.IMAGE_COMPRESS_API_TOKENS)
 
 const app = Fastify({
   logger: true,
@@ -27,7 +37,7 @@ app.get(`${apiBasePath}/healthz`, async () => {
   return { status: 'ok' }
 })
 
-app.register(compressRoutes, { apiToken, prefix: apiBasePath })
+app.register(compressRoutes, { apiTokens, prefix: apiBasePath })
 
 app.setErrorHandler((error, request, reply) => {
   if (error instanceof HttpError) {

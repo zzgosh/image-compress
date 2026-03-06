@@ -14,7 +14,18 @@ const safeTokenCompare = (provided: string, expected: string): boolean => {
   return timingSafeEqual(providedBuffer, expectedBuffer)
 }
 
-export const assertAuthorized = (authorizationHeader: string | undefined, expectedToken: string): void => {
+const safeTokenMatchAny = (providedToken: string, expectedTokens: readonly string[]): boolean => {
+  let matched = false
+
+  // 不因“匹配顺序”提前返回，降低可观测的时序差异。
+  for (const expectedToken of expectedTokens) {
+    matched = safeTokenCompare(providedToken, expectedToken) || matched
+  }
+
+  return matched
+}
+
+export const assertAuthorized = (authorizationHeader: string | undefined, expectedTokens: readonly string[]): void => {
   if (!authorizationHeader) {
     throw new HttpError(401, 'UNAUTHORIZED', 'missing Authorization header')
   }
@@ -25,7 +36,7 @@ export const assertAuthorized = (authorizationHeader: string | undefined, expect
   }
 
   const providedToken = matched[1].trim()
-  if (!providedToken || !safeTokenCompare(providedToken, expectedToken)) {
+  if (!providedToken || !safeTokenMatchAny(providedToken, expectedTokens)) {
     throw new HttpError(401, 'UNAUTHORIZED', 'invalid token')
   }
 }
