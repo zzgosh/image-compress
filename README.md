@@ -136,12 +136,13 @@ Token 使用建议：
 
 - `responseMode=metadata`（默认）
   - `200` 返回 JSON（稳定的业务字段，适合自动化做 if/else）
-  - **`200` 不等于一定压缩变小**：请显式判断 `compressed` / `outcome`
+  - `compressed` / `outcome` 表示是否保留了处理后的输出，而不是“字节一定变小”
+  - 实际体积变化请看 `outputBytes` / `savedBytes` / `compressionRatio`
 - `responseMode=binary`
   - 单图返回图片二进制（与输入格式一致）
   - 多图返回 `application/zip`
   - 输出文件名默认基于原文件名追加 `_compressed` 后缀（例如 `a.png` => `a_compressed.png`）
-  - 若再编码后不更小，则回退原图（并保持原文件名）
+  - 若再编码后不更小，则默认回退原图（并保持原文件名）；但若需要修正 EXIF Orientation，则优先保留已旋转的输出
 
 ### Response Headers
 
@@ -150,12 +151,16 @@ Token 使用建议：
 - `X-Original-Bytes`（输入总字节数）
 - `X-Compressed-Bytes`（输出图片总字节数；ZIP 场景不包含容器开销）
 - `X-Compression-Ratio`（节省百分比，保留 2 位小数）
-- `X-Compressed`（`true`/`false`）
-- `X-Outcome`（`compressed`/`fallback_original`）
+- `X-Compressed`（`true`/`false`，表示响应中是否保留了处理后的输出）
+- `X-Outcome`（`compressed`/`fallback_original`，表示是否回退到了原图）
 
 ### Success JSON (`responseMode=metadata`)
 
 `200` 返回结构化 JSON（字段为英文，便于自动化工具稳定判断）：
+
+- 顶层 `compressed` / `outcome` 是本次响应的汇总结果
+- 批量场景请以 `results[]` 查看每个文件是否真的回退原图
+- 是否节省体积请看 `outputBytes` / `savedBytes` / `compressionRatio`
 
 ```json
 {
@@ -284,6 +289,7 @@ npm run check && npm run build
 - 传入旧参数 `quality/targetFormat/output`（应返回 `400`）
 - 上传非 `jpg/png/webp`（应返回 `415`）
 - 上传不支持或不可解码的文件（可能返回 `415` 或 `422`）
+- 上传带 EXIF Orientation 的图片：若旋转归一化后体积略增，仍应保留旋转后的输出
 - `responseMode=metadata`（默认）：返回 JSON；覆盖 `compressed` 与 `fallback_original` 两种业务结果
 - `responseMode=binary`：单图返回图片二进制、多图返回 ZIP；并检查 `Content-Disposition` 与辅助 headers
 - 总大小超限（应返回 `413`）
@@ -301,6 +307,7 @@ npm run check && npm run build
 │       ├── ci.yml            # GitHub Actions：类型检查与构建
 │       └── deploy.yml         # GitHub Actions：构建并推送镜像（GHCR）
 ├── local-docs                # 本地文档（不提交）
+├── tests                     # Node 内置测试与回归用例
 ├── src
 │   ├── lib
 │   │   ├── auth.ts          # Bearer Token 鉴权（多 Token）

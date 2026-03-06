@@ -9,7 +9,7 @@ import {
   sanitizeFileName
 } from '../lib/validate.js'
 import { createZipStream, withUniqueZipEntryNames } from '../lib/zip.js'
-import { HttpError, type UploadedImage } from '../types/api.js'
+import { HttpError, type CompressedImageResult, type UploadedImage } from '../types/api.js'
 
 interface CompressRoutesOptions {
   apiTokens: string[]
@@ -17,6 +17,7 @@ interface CompressRoutesOptions {
 
 type ResponseMode = 'metadata' | 'binary'
 type CompressOutcome = 'compressed' | 'fallback_original'
+type CompressReason = 'reencoded_not_smaller'
 
 const sumBytes = (values: number[]): number => values.reduce((total, value) => total + value, 0)
 
@@ -45,6 +46,28 @@ const drainReadable = async (stream: NodeJS.ReadableStream): Promise<void> => {
     }
   } catch {
     // best-effort drain, ignore errors here
+  }
+}
+
+const resolveFileOutcome = (
+  file: CompressedImageResult
+): { compressed: boolean; outcome: CompressOutcome; reason?: CompressReason } => {
+  const compressed = !file.usedFallback
+  return {
+    compressed,
+    outcome: compressed ? 'compressed' : 'fallback_original',
+    reason: compressed ? undefined : 'reencoded_not_smaller'
+  }
+}
+
+const resolveResponseOutcome = (
+  files: CompressedImageResult[]
+): { compressed: boolean; outcome: CompressOutcome; reason?: CompressReason } => {
+  const compressed = files.some((file) => !file.usedFallback)
+  return {
+    compressed,
+    outcome: compressed ? 'compressed' : 'fallback_original',
+    reason: compressed ? undefined : 'reencoded_not_smaller'
   }
 }
 
@@ -146,8 +169,7 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
     const ratio = originalBytes > 0 ? ((savedBytes / originalBytes) * 100).toFixed(2) : '0.00'
     const compressionRatio = originalBytes > 0 ? savedBytes / originalBytes : 0
 
-    const compressed = outputBytes < originalBytes
-    const outcome: CompressOutcome = compressed ? 'compressed' : 'fallback_original'
+    const { compressed, outcome, reason } = resolveResponseOutcome(compressedFiles)
 
     if (responseMode === 'metadata') {
       const outputType = outputFiles.length === 1 ? ('single' as const) : ('zip' as const)
@@ -162,7 +184,7 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
         success: true,
         compressed,
         outcome,
-        reason: outcome === 'fallback_original' ? 'reencoded_not_smaller' : undefined,
+        reason,
         originalBytes,
         outputBytes,
         savedBytes,
@@ -172,10 +194,9 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
         outputFileName,
         fileCount: files.length,
         results: outputFiles.map((file) => {
+          const { compressed: fileCompressed, outcome: fileOutcome, reason: fileReason } = resolveFileOutcome(file)
           const fileSavedBytes = file.originalBytes - file.compressedBytes
           const fileCompressionRatio = file.originalBytes > 0 ? fileSavedBytes / file.originalBytes : 0
-          const fileCompressed = file.compressedBytes < file.originalBytes
-          const fileOutcome: CompressOutcome = fileCompressed ? 'compressed' : 'fallback_original'
 
           return {
             originalFileName: file.sourceFileName,
@@ -183,7 +204,7 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
             outputMimeType: file.outputMimeType,
             compressed: fileCompressed,
             outcome: fileOutcome,
-            reason: fileOutcome === 'fallback_original' ? 'reencoded_not_smaller' : undefined,
+            reason: fileReason,
             originalBytes: file.originalBytes,
             outputBytes: file.compressedBytes,
             savedBytes: fileSavedBytes,

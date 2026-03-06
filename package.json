@@ -12,6 +12,7 @@
     "dev": "node --env-file=.env ./node_modules/.bin/tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test tests/compress.test.ts",
     "start": "node dist/server.js"
   },
   "dependencies": {

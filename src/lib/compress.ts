@@ -125,7 +125,8 @@ const compressSingleImage = async (file: UploadedImage): Promise<CompressedImage
   let outputFileName = buildOutputFileName(file.fileName, outputFormat)
 
   // 统一启用“变大回退原图”，避免再编码导致体积增长。
-  if (outputBuffer.length >= file.byteLength) {
+  // 例外：当输入包含 EXIF Orientation 时，优先保证输出方向正确，不回退到原图。
+  if (outputBuffer.length >= file.byteLength && !source.needsRotate) {
     outputBuffer = file.buffer
     usedFallback = true
     outputFileName = file.fileName

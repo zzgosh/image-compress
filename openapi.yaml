@@ -12,7 +12,7 @@ info:
     - Output format always matches the detected input format (JPEG/PNG/WebP). Format conversion is not supported.
     - Input format is detected from file bytes (not file extension nor multipart content-type).
     - Compression settings are fixed server-side (no request parameters for tuning).
-    - If re-encoding produces a larger or equal output, the service falls back to the original bytes.
+    - If re-encoding produces a larger or equal output, the service falls back to the original bytes unless keeping the rotated output is required to normalize EXIF Orientation.
 servers:
   - url: http://localhost:3001
 
@@ -74,7 +74,8 @@ paths:
         - `binary`: streams the final binary output (single image or ZIP).
 
         HTTP 200 means the request was processed successfully, but **does not** guarantee the output is smaller.
-        In `metadata` mode, always branch on `compressed` / `outcome`.
+        In `metadata` mode, `compressed` / `outcome` indicate whether the response keeps processed output or falls back to original bytes.
+        Use `outputBytes` / `savedBytes` / `compressionRatio` to inspect byte savings.
       security:
         - bearerAuth: []
       parameters:
@@ -137,11 +138,11 @@ paths:
                 enum:
                   - 'true'
                   - 'false'
-              description: Whether `X-Compressed-Bytes` is smaller than `X-Original-Bytes` (binary mode only).
+              description: Whether the binary response keeps processed output for at least one file (binary mode only).
             X-Outcome:
               schema:
                 $ref: '#/components/schemas/CompressOutcome'
-              description: Business outcome derived from the byte comparison (binary mode only).
+              description: Summary business outcome for the binary response (binary mode only).
             Content-Disposition:
               schema:
                 type: string
@@ -249,7 +250,7 @@ components:
         - fallback_original
       description: |
         Business outcome for a successful request.
-        `fallback_original` means re-encoding did not reduce bytes, so the service returns the original bytes.
+        `fallback_original` means every file in the response fell back to the original bytes.
     CompressOutputType:
       type: string
       enum:
@@ -267,7 +268,7 @@ components:
           description: MIME type of the output image bytes for this file.
         compressed:
           type: boolean
-          description: Whether `outputBytes` is smaller than `originalBytes` for this file.
+          description: Whether this file keeps the processed output instead of falling back to the original bytes.
         outcome:
           $ref: '#/components/schemas/CompressOutcome'
         reason:
@@ -305,12 +306,12 @@ components:
           example: true
         compressed:
           type: boolean
-          description: Whether total `outputBytes` is smaller than total `originalBytes`.
+          description: Whether the response keeps processed output for at least one file.
         outcome:
           $ref: '#/components/schemas/CompressOutcome'
         reason:
           type: string
-          description: Present only when `outcome=fallback_original` (i.e., no bytes were saved overall).
+          description: Present only when `outcome=fallback_original` (i.e., every file in the response fell back to the original bytes).
           example: reencoded_not_smaller
         originalBytes:
           type: integer
