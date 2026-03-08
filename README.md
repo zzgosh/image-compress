@@ -130,6 +130,7 @@ docker run --rm -p 3001:3001 \
   - 本机直接运行：默认落到系统临时目录下的 `image-compress-api-results`
   - Docker 容器内运行：默认落到容器内的 `/tmp/image-compress-api-results`
   - 如果容器重建且未挂载卷，这些临时结果会一起消失
+- 服务只会清理自己创建的临时结果文件，不会递归删除 `RESULT_STORAGE_DIR` 里的其他内容
 
 ## Environment Variables
 

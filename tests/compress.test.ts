@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { readFile, readdir } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm as removeFileSystemEntry, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import multipart from '@fastify/multipart'
@@ -313,6 +314,8 @@ const createApp = async (options?: {
   return app
 }
 
+const createTempStorageDir = async (): Promise<string> => mkdtemp(path.join(tmpdir(), 'image-compress-result-store-test-'))
+
 const getRawPayload = (response: { rawPayload: Buffer }): Buffer => response.rawPayload
 
 const assertDownloadConsumedOnce = async (
@@ -365,6 +368,90 @@ test('compressImages keeps rotated JPEG output when EXIF normalization makes it 
   assert.equal(outputMetadata.width, candidate.height)
   assert.equal(outputMetadata.height, candidate.width)
   assert.notEqual(outputMetadata.orientation, 6)
+})
+
+test('result store only removes service-managed artifacts inside the storage directory', async (t) => {
+  const storageDir = await createTempStorageDir()
+  t.after(async () => {
+    await removeFileSystemEntry(storageDir, { recursive: true, force: true })
+  })
+
+  await writeFile(path.join(storageDir, 'keep.txt'), 'preserve-me')
+  await writeFile(path.join(storageDir, 'result-00000000-0000-0000-0000-000000000000.bin'), 'stale-managed')
+
+  const store = new EphemeralResultStore({
+    storageDir,
+    ttlMs: 300_000,
+    maxTotalBytes: 1024 * 1024
+  })
+  t.after(async () => {
+    await store.close()
+  })
+
+  await store.init()
+
+  const namesAfterInit = (await readdir(storageDir)).sort()
+  assert.deepEqual(namesAfterInit, ['.image-compress-result-store', 'keep.txt'])
+
+  await store.create({
+    type: 'single',
+    fileName: 'demo.jpg',
+    mimeType: 'image/jpeg',
+    buffer: Buffer.from('managed-result')
+  })
+
+  const namesAfterCreate = (await readdir(storageDir)).sort()
+  assert.equal(namesAfterCreate.includes('keep.txt'), true)
+  assert.equal(namesAfterCreate.includes('.image-compress-result-store'), true)
+  assert.equal(namesAfterCreate.some((name) => name.startsWith('result-') && name.endsWith('.bin')), true)
+
+  await store.close()
+
+  const namesAfterClose = (await readdir(storageDir)).sort()
+  assert.deepEqual(namesAfterClose, ['.image-compress-result-store', 'keep.txt'])
+})
+
+test('result store serializes concurrent creates so the storage cap cannot be overshot', async (t) => {
+  const storageDir = await createTempStorageDir()
+  t.after(async () => {
+    await removeFileSystemEntry(storageDir, { recursive: true, force: true })
+  })
+
+  const buffer = Buffer.alloc(1024, 7)
+  const store = new EphemeralResultStore({
+    storageDir,
+    ttlMs: 300_000,
+    maxTotalBytes: buffer.length + 128
+  })
+  t.after(async () => {
+    await store.close()
+  })
+
+  await store.init()
+
+  const results = await Promise.allSettled([
+    store.create({
+      type: 'single',
+      fileName: 'first.jpg',
+      mimeType: 'image/jpeg',
+      buffer
+    }),
+    store.create({
+      type: 'single',
+      fileName: 'second.jpg',
+      mimeType: 'image/jpeg',
+      buffer
+    })
+  ])
+
+  const fulfilledCount = results.filter((result) => result.status === 'fulfilled').length
+  const rejectedResults = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+
+  assert.equal(fulfilledCount, 1)
+  assert.equal(rejectedResults.length, 1)
+  assert.ok(rejectedResults[0].reason instanceof HttpError)
+  assert.equal(rejectedResults[0].reason.statusCode, 507)
+  assert.equal(rejectedResults[0].reason.code, 'INSUFFICIENT_STORAGE')
 })
 
 test('compress route returns metadata and a one-time download URL for single file output', async (t) => {

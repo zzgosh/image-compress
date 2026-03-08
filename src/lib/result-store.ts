@@ -58,6 +58,8 @@ export interface ClaimedResult {
 
 const DEFAULT_STORAGE_DIR = path.join(tmpdir(), 'image-compress-api-results')
 const DEFAULT_CLEANUP_INTERVAL_MS = 30_000
+const STORE_MARKER_FILE_NAME = '.image-compress-result-store'
+const MANAGED_RESULT_FILE_PATTERN = /^result-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(bin|tmp)$/i
 
 const safeTokenEqual = (provided: string, expected: string): boolean => {
   const providedBuffer = Buffer.from(provided)
@@ -80,6 +82,7 @@ export class EphemeralResultStore {
   private readonly now: () => number
   private readonly cleanupIntervalMs: number
   private cleanupTimer?: NodeJS.Timeout
+  private operationChain: Promise<void> = Promise.resolve()
   private totalBytes = 0
 
   constructor(options: ResultStoreOptions) {
@@ -91,8 +94,13 @@ export class EphemeralResultStore {
   }
 
   async init(): Promise<void> {
-    await fs.rm(this.storageDir, { recursive: true, force: true })
-    await fs.mkdir(this.storageDir, { recursive: true })
+    await this.runExclusive(async () => {
+      await fs.mkdir(this.storageDir, { recursive: true })
+      await fs.writeFile(path.join(this.storageDir, STORE_MARKER_FILE_NAME), 'image-compress-result-store\n')
+      this.entries.clear()
+      this.totalBytes = 0
+      await this.removeManagedArtifacts()
+    })
 
     this.cleanupTimer = setInterval(() => {
       void this.sweepExpired()
@@ -106,97 +114,112 @@ export class EphemeralResultStore {
       this.cleanupTimer = undefined
     }
 
-    this.entries.clear()
-    this.totalBytes = 0
-    await fs.rm(this.storageDir, { recursive: true, force: true })
+    await this.runExclusive(async () => {
+      const trackedEntries = [...this.entries.values()]
+      for (const entry of trackedEntries) {
+        await this.deleteEntryLocked(entry)
+      }
+
+      this.entries.clear()
+      this.totalBytes = 0
+      await this.removeManagedArtifacts()
+    })
   }
 
   async create(input: ResultArtifactInput): Promise<CreatedResult> {
-    await this.sweepExpired()
+    return this.runExclusive(async () => {
+      await this.sweepExpiredLocked()
 
-    const id = randomUUID()
-    const token = randomBytes(24).toString('base64url')
-    const finalPath = path.join(this.storageDir, `${id}.bin`)
-    const tempPath = path.join(this.storageDir, `${id}.tmp`)
+      const id = randomUUID()
+      const token = randomBytes(24).toString('base64url')
+      const finalPath = path.join(this.storageDir, this.buildManagedFileName(id, 'bin'))
+      const tempPath = path.join(this.storageDir, this.buildManagedFileName(id, 'tmp'))
 
-    let byteLength = 0
+      let byteLength = 0
 
-    try {
-      if (input.type === 'single') {
-        byteLength = input.buffer.length
-        this.assertStorageCapacity(byteLength)
-        await fs.writeFile(tempPath, input.buffer)
-      } else {
-        await createZipFile(input.files, tempPath)
-        const stats = await fs.stat(tempPath)
-        byteLength = stats.size
-        this.assertStorageCapacity(byteLength)
+      try {
+        if (input.type === 'single') {
+          byteLength = input.buffer.length
+          this.assertStorageCapacity(byteLength)
+          await fs.writeFile(tempPath, input.buffer)
+        } else {
+          await createZipFile(input.files, tempPath)
+          const stats = await fs.stat(tempPath)
+          byteLength = stats.size
+          this.assertStorageCapacity(byteLength)
+        }
+
+        await fs.rename(tempPath, finalPath)
+
+        const expiresAt = this.now() + this.ttlMs
+        this.entries.set(id, {
+          id,
+          token,
+          fileName: input.fileName,
+          mimeType: input.mimeType,
+          filePath: finalPath,
+          byteLength,
+          expiresAt,
+          downloading: false
+        })
+        this.totalBytes += byteLength
+
+        return {
+          id,
+          token,
+          expiresAt: new Date(expiresAt).toISOString()
+        }
+      } catch (error) {
+        await fs.rm(tempPath, { force: true })
+        await fs.rm(finalPath, { force: true })
+        throw error
       }
-
-      await fs.rename(tempPath, finalPath)
-
-      const expiresAt = this.now() + this.ttlMs
-      this.entries.set(id, {
-        id,
-        token,
-        fileName: input.fileName,
-        mimeType: input.mimeType,
-        filePath: finalPath,
-        byteLength,
-        expiresAt,
-        downloading: false
-      })
-      this.totalBytes += byteLength
-
-      return {
-        id,
-        token,
-        expiresAt: new Date(expiresAt).toISOString()
-      }
-    } catch (error) {
-      await fs.rm(tempPath, { force: true })
-      await fs.rm(finalPath, { force: true })
-      throw error
-    }
+    })
   }
 
   async claim(id: string, token: string | undefined): Promise<ClaimedResult> {
-    await this.sweepExpired()
+    return this.runExclusive(async () => {
+      await this.sweepExpiredLocked()
 
-    if (!token) {
-      throw resultNotFound()
-    }
-
-    const entry = this.entries.get(id)
-    if (!entry || entry.downloading || !safeTokenEqual(token, entry.token)) {
-      throw resultNotFound()
-    }
-
-    entry.downloading = true
-    const stream = createReadStream(entry.filePath)
-
-    return {
-      fileName: entry.fileName,
-      mimeType: entry.mimeType,
-      byteLength: entry.byteLength,
-      stream,
-      markCompleted: async () => {
-        const current = this.entries.get(id)
-        if (!current) return
-        await this.deleteEntry(current)
-      },
-      markAborted: async () => {
-        const current = this.entries.get(id)
-        if (!current) return
-
-        if (current.expiresAt <= this.now()) {
-          await this.deleteEntry(current)
-          return
-        }
-
-        current.downloading = false
+      if (!token) {
+        throw resultNotFound()
       }
-    }
+
+      const entry = this.entries.get(id)
+      if (!entry || entry.downloading || !safeTokenEqual(token, entry.token)) {
+        throw resultNotFound()
+      }
+
+      entry.downloading = true
+      const stream = createReadStream(entry.filePath)
+
+      return {
+        fileName: entry.fileName,
+        mimeType: entry.mimeType,
+        byteLength: entry.byteLength,
+        stream,
+        markCompleted: async () => {
+          await this.runExclusive(async () => {
+            const current = this.entries.get(id)
+            if (!current) return
+            await this.deleteEntryLocked(current)
+          })
+        },
+        markAborted: async () => {
+          await this.runExclusive(async () => {
+            const current = this.entries.get(id)
+            if (!current) return
+
+            if (current.expiresAt <= this.now()) {
+              await this.deleteEntryLocked(current)
+              return
+            }
+
+            current.downloading = false
+          })
+        }
+      }
+    })
   }
 
   private assertStorageCapacity(nextBytes: number): void {
@@ -209,16 +232,35 @@ export class EphemeralResultStore {
     }
   }
 
+  private buildManagedFileName(id: string, extension: 'bin' | 'tmp'): string {
+    return `result-${id}.${extension}`
+  }
+
+  private async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const nextOperation = this.operationChain.then(operation, operation)
+    this.operationChain = nextOperation.then(
+      () => undefined,
+      () => undefined
+    )
+    return nextOperation
+  }
+
   private async sweepExpired(): Promise<void> {
+    await this.runExclusive(async () => {
+      await this.sweepExpiredLocked()
+    })
+  }
+
+  private async sweepExpiredLocked(): Promise<void> {
     const now = this.now()
     const expiredEntries = [...this.entries.values()].filter((entry) => !entry.downloading && entry.expiresAt <= now)
 
     for (const entry of expiredEntries) {
-      await this.deleteEntry(entry)
+      await this.deleteEntryLocked(entry)
     }
   }
 
-  private async deleteEntry(entry: StoredResult): Promise<void> {
+  private async deleteEntryLocked(entry: StoredResult): Promise<void> {
     const existing = this.entries.get(entry.id)
     if (!existing) return
 
@@ -233,5 +275,31 @@ export class EphemeralResultStore {
         throw error
       }
     }
+  }
+
+  private async removeManagedArtifacts(): Promise<void> {
+    let entries
+    try {
+      entries = await fs.readdir(this.storageDir, { withFileTypes: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return
+      }
+      throw error
+    }
+
+    await Promise.all(
+      entries.map(async (entry) => {
+        if (!entry.isFile()) {
+          return
+        }
+
+        if (!MANAGED_RESULT_FILE_PATTERN.test(entry.name)) {
+          return
+        }
+
+        await fs.rm(path.join(this.storageDir, entry.name), { force: true })
+      })
+    )
   }
 }
