@@ -46,7 +46,7 @@ export const createZipFile = async (files: CompressedImageResult[], filePath: st
   })
 
   archive.pipe(output)
-  for (const file of withUniqueZipEntryNames(files)) {
+  for (const file of files) {
     archive.append(file.buffer, { name: file.fileName })
   }
 

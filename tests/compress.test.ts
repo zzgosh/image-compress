@@ -10,6 +10,7 @@ import sharp from 'sharp'
 import { compressImages } from '../src/lib/compress.ts'
 import { EphemeralResultStore } from '../src/lib/result-store.ts'
 import { formatMegabyteSize } from '../src/lib/size.ts'
+import { createZipFile } from '../src/lib/zip.ts'
 import {
   DEFAULT_UPLOAD_MAX_FILE_COUNT,
   DEFAULT_UPLOAD_MAX_FILE_SIZE_BYTES,
@@ -453,6 +454,45 @@ test('result store serializes concurrent creates so the storage cap cannot be ov
   assert.ok(rejectedResults[0].reason instanceof HttpError)
   assert.equal(rejectedResults[0].reason.statusCode, 507)
   assert.equal(rejectedResults[0].reason.code, 'INSUFFICIENT_STORAGE')
+})
+
+test('createZipFile preserves the unique entry names chosen by metadata generation', async (t) => {
+  const storageDir = await createTempStorageDir()
+  t.after(async () => {
+    await removeFileSystemEntry(storageDir, { recursive: true, force: true })
+  })
+
+  const zipPath = path.join(storageDir, 'archive.zip')
+  await createZipFile(
+    [
+      {
+        sourceFileName: 'a.jpg',
+        fileName: 'a.jpg',
+        inputMimeType: 'image/jpeg',
+        outputMimeType: 'image/jpeg',
+        originalBytes: 1,
+        compressedBytes: 1,
+        usedFallback: false,
+        buffer: Buffer.from('a')
+      },
+      {
+        sourceFileName: 'a.jpg',
+        fileName: 'a_1.jpg',
+        inputMimeType: 'image/jpeg',
+        outputMimeType: 'image/jpeg',
+        originalBytes: 1,
+        compressedBytes: 1,
+        usedFallback: false,
+        buffer: Buffer.from('b')
+      }
+    ],
+    zipPath
+  )
+
+  const zipBuffer = await readFile(zipPath)
+  assert.equal(zipBuffer.includes(Buffer.from('a.jpg')), true)
+  assert.equal(zipBuffer.includes(Buffer.from('a_1.jpg')), true)
+  assert.equal(zipBuffer.includes(Buffer.from('a_1_1.jpg')), false)
 })
 
 test('server rejects integer env vars with non-numeric suffixes', () => {

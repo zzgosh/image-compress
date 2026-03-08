@@ -57,7 +57,7 @@ export interface ClaimedResult {
 }
 
 const DEFAULT_STORAGE_DIR = path.join(tmpdir(), 'image-compress-api-results')
-const DEFAULT_STAGING_DIR = path.join(tmpdir(), 'image-compress-api-result-store-staging')
+const DEFAULT_STAGING_ROOT_DIR = path.join(tmpdir(), 'image-compress-api-result-store-staging')
 const DEFAULT_CLEANUP_INTERVAL_MS = 30_000
 const STORE_MARKER_FILE_NAME = '.image-compress-result-store'
 const MANAGED_RESULT_FILE_PATTERN = /^result-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(bin|tmp)$/i
@@ -89,7 +89,7 @@ export class EphemeralResultStore {
 
   constructor(options: ResultStoreOptions) {
     this.storageDir = options.storageDir ?? DEFAULT_STORAGE_DIR
-    this.stagingDir = DEFAULT_STAGING_DIR
+    this.stagingDir = path.join(DEFAULT_STAGING_ROOT_DIR, randomUUID())
     this.ttlMs = options.ttlMs
     this.maxTotalBytes = options.maxTotalBytes
     this.now = options.now ?? (() => Date.now())
@@ -104,7 +104,6 @@ export class EphemeralResultStore {
       this.entries.clear()
       this.totalBytes = 0
       await this.removeManagedArtifacts(this.storageDir)
-      await this.removeManagedArtifacts(this.stagingDir)
     })
 
     this.cleanupTimer = setInterval(() => {
@@ -128,7 +127,7 @@ export class EphemeralResultStore {
       this.entries.clear()
       this.totalBytes = 0
       await this.removeManagedArtifacts(this.storageDir)
-      await this.removeManagedArtifacts(this.stagingDir)
+      await fs.rm(this.stagingDir, { recursive: true, force: true })
     })
   }
 
