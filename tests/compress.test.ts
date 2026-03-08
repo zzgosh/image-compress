@@ -497,8 +497,8 @@ test('createZipFile preserves the unique entry names chosen by metadata generati
 
 test('server rejects integer env vars with non-numeric suffixes', () => {
   const invalidCases = [
-    ['RESULT_TTL_SECONDS', '10foo'],
-    ['UPLOAD_MAX_FILE_COUNT', '1e3']
+    ['IMAGE_COMPRESS_API_RESULT_TTL_SECONDS', '10foo'],
+    ['IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT', '1e3']
   ] as const
 
   for (const [envName, envValue] of invalidCases) {
@@ -514,6 +514,30 @@ test('server rejects integer env vars with non-numeric suffixes', () => {
 
     assert.notEqual(result.status, 0, `${envName} should fail startup`)
     assert.match(`${result.stderr}${result.stdout}`, new RegExp(envName), envName)
+  }
+})
+
+test('server rejects legacy unprefixed env vars at startup', () => {
+  const legacyCases = [
+    ['PORT', '3001', 'IMAGE_COMPRESS_API_PORT'],
+    ['PUBLIC_BASE_URL', 'http://127.0.0.1:3001', 'IMAGE_COMPRESS_API_PUBLIC_BASE_URL'],
+    ['RESULT_STORAGE_MAX_SIZE', '256MB', 'IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE']
+  ] as const
+
+  for (const [legacyEnvName, envValue, replacementEnvName] of legacyCases) {
+    const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        IMAGE_COMPRESS_API_TOKENS: 'test-token',
+        [legacyEnvName]: envValue
+      },
+      encoding: 'utf8'
+    })
+
+    assert.notEqual(result.status, 0, `${legacyEnvName} should fail startup`)
+    assert.match(`${result.stderr}${result.stdout}`, new RegExp(legacyEnvName), legacyEnvName)
+    assert.match(`${result.stderr}${result.stdout}`, new RegExp(replacementEnvName), replacementEnvName)
   }
 })
 

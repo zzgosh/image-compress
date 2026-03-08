@@ -16,6 +16,25 @@
   - PNG：使用 palette 量化固定配置（有损），并启用“变大回退原图”
 - 默认上传限制（可通过环境变量调整）：单图 `20MB`、最多 `30` 张、总计 `80MB`
 
+## Directory Structure
+
+```text
+.
+|-- src/
+|   |-- server.ts              # Fastify 入口，环境变量解析与服务装配
+|   |-- routes/                # 压缩与结果下载路由
+|   |-- lib/                   # 压缩、鉴权、结果存储等核心逻辑
+|   `-- types/                 # API 类型与错误定义
+|-- tests/
+|   `-- compress.test.ts       # 端到端与启动配置测试
+|-- test_images/               # 测试夹具图片与异常样本
+|-- .env.example               # 环境变量示例
+|-- Dockerfile                 # 容器构建与运行入口
+|-- openapi.yaml               # OpenAPI 合约
+|-- package.json               # 脚本与依赖
+`-- .github/workflows/         # CI 与镜像构建工作流
+```
+
 ## Protocol Overview
 
 现在的流程固定为两步：
@@ -57,25 +76,25 @@ TOKEN_2="$(openssl rand -hex 32)"
 ```bash
 cat > .env <<'EOF'
 IMAGE_COMPRESS_API_TOKENS=replace_me_with_a_random_token_1,replace_me_with_a_random_token_2
-PORT=3001
-HOST=0.0.0.0
-PUBLIC_BASE_URL=http://127.0.0.1:3001
-UPLOAD_MAX_FILE_SIZE=20MB
-UPLOAD_MAX_FILE_COUNT=30
-UPLOAD_MAX_TOTAL_SIZE=80MB
-RESULT_TTL_SECONDS=300
-RESULT_STORAGE_MAX_SIZE=256MB
+IMAGE_COMPRESS_API_PORT=3001
+IMAGE_COMPRESS_API_HOST=0.0.0.0
+IMAGE_COMPRESS_API_PUBLIC_BASE_URL=http://127.0.0.1:3001
+IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_SIZE=20MB
+IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT=30
+IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE=80MB
+IMAGE_COMPRESS_API_RESULT_TTL_SECONDS=300
+IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE=256MB
 EOF
 ```
 
 说明：
 
-- `PUBLIC_BASE_URL` 建议显式配置；这样返回的 `download.url` 会稳定指向外部可访问地址
-- `UPLOAD_MAX_FILE_SIZE` / `UPLOAD_MAX_FILE_COUNT` / `UPLOAD_MAX_TOTAL_SIZE` 是上传入口限制
-- `RESULT_TTL_SECONDS` 是临时结果的保留时长
-- `RESULT_STORAGE_MAX_SIZE` 是服务端临时结果目录的总存储上限
+- `IMAGE_COMPRESS_API_PUBLIC_BASE_URL` 建议显式配置；这样返回的 `download.url` 会稳定指向外部可访问地址
+- `IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_SIZE` / `IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT` / `IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE` 是上传入口限制
+- `IMAGE_COMPRESS_API_RESULT_TTL_SECONDS` 是临时结果的保留时长
+- `IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE` 是服务端临时结果目录的总存储上限
 - 容量型环境变量支持原始字节整数，或使用大写 `MB` 后缀，例如 `20MB`、`80MB`、`256MB`
-- 整数型环境变量只接受纯数字，例如 `RESULT_TTL_SECONDS=300`、`UPLOAD_MAX_FILE_COUNT=30`
+- 整数型环境变量只接受纯数字，例如 `IMAGE_COMPRESS_API_RESULT_TTL_SECONDS=300`、`IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT=30`
 
 ### 3) 类型检查 + 构建 + 启动
 
@@ -110,7 +129,7 @@ docker build -t image-compress-api:local .
 ```bash
 docker run --rm -p 3001:3001 \
   -e IMAGE_COMPRESS_API_TOKENS=replace_me_with_a_random_token_1,replace_me_with_a_random_token_2 \
-  -e PUBLIC_BASE_URL=http://127.0.0.1:3001 \
+  -e IMAGE_COMPRESS_API_PUBLIC_BASE_URL=http://127.0.0.1:3001 \
   image-compress-api:local
 ```
 
@@ -124,34 +143,34 @@ docker run --rm -p 3001:3001 \
 - 建议把服务放在反向代理（如 Nginx）之后
 - 如果使用 Nginx 反代，需要在 **Nginx 配置文件** 里设置 `client_max_body_size`；这不是 `.env` 变量
   - 默认上传总上限是 `80MB`，服务端会额外预留约 `10MB` multipart 开销，所以默认可先设为不小于 **90m**
-  - 如果你把 `UPLOAD_MAX_TOTAL_SIZE` 调大了，也要同步把 Nginx 的 `client_max_body_size` 调大
+  - 如果你把 `IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE` 调大了，也要同步把 Nginx 的 `client_max_body_size` 调大
   - 作用：避免请求还没到 Node/Fastify，就先被 Nginx 以请求体过大拦掉
-- 生产环境建议显式配置 `PUBLIC_BASE_URL`
-- 如果未设置 `RESULT_STORAGE_DIR`：
+- 生产环境建议显式配置 `IMAGE_COMPRESS_API_PUBLIC_BASE_URL`
+- 如果未设置 `IMAGE_COMPRESS_API_RESULT_STORAGE_DIR`：
   - 本机直接运行：默认落到系统临时目录下的 `image-compress-api-results`
   - Docker 容器内运行：默认落到容器内的 `/tmp/image-compress-api-results`
   - 如果容器重建且未挂载卷，这些临时结果会一起消失
-- 服务只会清理自己创建的临时结果文件，不会递归删除 `RESULT_STORAGE_DIR` 里的其他内容
+- 服务只会清理自己创建的临时结果文件，不会递归删除 `IMAGE_COMPRESS_API_RESULT_STORAGE_DIR` 里的其他内容
 
 ## Environment Variables
 
 | Name | Required | Default | Description |
 | --- | --- | --- | --- |
 | `IMAGE_COMPRESS_API_TOKENS` | Yes | - | Bearer 鉴权 Token 列表（逗号分隔） |
-| `PORT` | No | `3001` | 服务监听端口 |
-| `HOST` | No | `0.0.0.0` | 服务监听地址 |
-| `PUBLIC_BASE_URL` | No | 按请求头推断 | 返回给客户端的下载基地址 |
-| `UPLOAD_MAX_FILE_SIZE` | No | `20MB` | 单个上传文件大小上限 |
-| `UPLOAD_MAX_FILE_COUNT` | No | `30` | 单次请求允许上传的最大文件数 |
-| `UPLOAD_MAX_TOTAL_SIZE` | No | `80MB` | 单次请求所有上传文件的总大小上限 |
-| `RESULT_TTL_SECONDS` | No | `300` | 临时结果存活秒数 |
-| `RESULT_STORAGE_MAX_SIZE` | No | `256MB` | 临时结果总存储上限 |
-| `RESULT_STORAGE_DIR` | No | 系统临时目录下的 `image-compress-api-results` | 临时结果落盘目录；Docker 内默认对应 `/tmp/image-compress-api-results` |
+| `IMAGE_COMPRESS_API_PORT` | No | `3001` | 服务监听端口 |
+| `IMAGE_COMPRESS_API_HOST` | No | `0.0.0.0` | 服务监听地址 |
+| `IMAGE_COMPRESS_API_PUBLIC_BASE_URL` | No | 按请求头推断 | 返回给客户端的下载基地址 |
+| `IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_SIZE` | No | `20MB` | 单个上传文件大小上限 |
+| `IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT` | No | `30` | 单次请求允许上传的最大文件数 |
+| `IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE` | No | `80MB` | 单次请求所有上传文件的总大小上限 |
+| `IMAGE_COMPRESS_API_RESULT_TTL_SECONDS` | No | `300` | 临时结果存活秒数 |
+| `IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE` | No | `256MB` | 临时结果总存储上限 |
+| `IMAGE_COMPRESS_API_RESULT_STORAGE_DIR` | No | 系统临时目录下的 `image-compress-api-results` | 临时结果落盘目录；Docker 内默认对应 `/tmp/image-compress-api-results` |
 
 说明：
 
-- `UPLOAD_*` 限制的是“客户端发进来的请求体”
-- `RESULT_STORAGE_MAX_SIZE` 限制的是“服务端临时结果目录最多能占多少磁盘”
+- `IMAGE_COMPRESS_API_UPLOAD_*` 限制的是“客户端发进来的请求体”
+- `IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE` 限制的是“服务端临时结果目录最多能占多少磁盘”
 - 这两类限制互相独立，分别控制入口流量和服务端临时存储
 
 Token 使用建议：
@@ -324,7 +343,7 @@ curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
 - JSON metadata 会带回一次性 `download.url`
 - 客户端成功下载后，服务会删除该产物
 - 如果客户端下载中断，资源会保留到 TTL 到期，再由清理逻辑回收
-- 如果临时结果总大小超过 `RESULT_STORAGE_MAX_SIZE`，新请求会返回 `507 INSUFFICIENT_STORAGE`
+- 如果临时结果总大小超过 `IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE`，新请求会返回 `507 INSUFFICIENT_STORAGE`
 
 ## Testing Checklist
 

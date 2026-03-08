@@ -12,10 +12,24 @@ import compressRoutes from './routes/compress.js'
 import resultRoutes from './routes/results.js'
 import { HttpError } from './types/api.js'
 
-const port = Number.parseInt(process.env.PORT ?? '3001', 10)
-const host = process.env.HOST ?? '0.0.0.0'
+const ENV = {
+  apiTokens: 'IMAGE_COMPRESS_API_TOKENS',
+  host: 'IMAGE_COMPRESS_API_HOST',
+  port: 'IMAGE_COMPRESS_API_PORT',
+  publicBaseUrl: 'IMAGE_COMPRESS_API_PUBLIC_BASE_URL',
+  resultStorageDir: 'IMAGE_COMPRESS_API_RESULT_STORAGE_DIR',
+  resultStorageMaxSize: 'IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE',
+  resultTtlSeconds: 'IMAGE_COMPRESS_API_RESULT_TTL_SECONDS',
+  uploadMaxFileCount: 'IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT',
+  uploadMaxFileSize: 'IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_SIZE',
+  uploadMaxTotalSize: 'IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE'
+} as const
+
+const env = process.env
+const port = Number.parseInt(env[ENV.port] ?? '3001', 10)
+const host = env[ENV.host] ?? '0.0.0.0'
 const apiBasePath = '/api/image-compress'
-const publicBaseUrl = process.env.PUBLIC_BASE_URL?.trim()
+const publicBaseUrl = env[ENV.publicBaseUrl]?.trim()
 const MULTIPART_BODY_OVERHEAD_BYTES = 10 * MEGABYTE
 
 const parsePositiveIntegerEnv = (rawValue: string | undefined, defaultValue: number, envName: string): number => {
@@ -82,41 +96,57 @@ const normalizeBaseUrl = (rawValue: string | undefined): string | undefined => {
 
 const parseApiTokens = (rawValue: string | undefined): string[] => {
   if (!rawValue) {
-    throw new Error('缺少必填环境变量：IMAGE_COMPRESS_API_TOKENS')
+    throw new Error(`缺少必填环境变量：${ENV.apiTokens}`)
   }
 
   const normalizedItems = rawValue.split(',').map((item) => item.trim())
   if (normalizedItems.length === 0 || normalizedItems.some((item) => !item)) {
-    throw new Error('环境变量 IMAGE_COMPRESS_API_TOKENS 格式错误：请使用逗号分隔的非空 Token 列表')
+    throw new Error(`环境变量 ${ENV.apiTokens} 格式错误：请使用逗号分隔的非空 Token 列表`)
   }
 
   return [...new Set(normalizedItems)]
 }
 
-const apiTokens = parseApiTokens(process.env.IMAGE_COMPRESS_API_TOKENS)
-assertLegacyEnvIsUnset(process.env.RESULT_STORAGE_MAX_BYTES, 'RESULT_STORAGE_MAX_BYTES', 'RESULT_STORAGE_MAX_SIZE')
+const legacyEnvRenames: Array<[legacyEnvName: string, replacementEnvName: string]> = [
+  ['HOST', ENV.host],
+  ['PORT', ENV.port],
+  ['PUBLIC_BASE_URL', ENV.publicBaseUrl],
+  ['RESULT_STORAGE_DIR', ENV.resultStorageDir],
+  ['RESULT_STORAGE_MAX_BYTES', ENV.resultStorageMaxSize],
+  ['RESULT_STORAGE_MAX_SIZE', ENV.resultStorageMaxSize],
+  ['RESULT_TTL_SECONDS', ENV.resultTtlSeconds],
+  ['UPLOAD_MAX_FILE_COUNT', ENV.uploadMaxFileCount],
+  ['UPLOAD_MAX_FILE_SIZE', ENV.uploadMaxFileSize],
+  ['UPLOAD_MAX_TOTAL_SIZE', ENV.uploadMaxTotalSize]
+]
+
+for (const [legacyEnvName, replacementEnvName] of legacyEnvRenames) {
+  assertLegacyEnvIsUnset(env[legacyEnvName], legacyEnvName, replacementEnvName)
+}
+
+const apiTokens = parseApiTokens(env[ENV.apiTokens])
 
 const uploadLimits: UploadLimits = {
-  maxFileCount: parsePositiveIntegerEnv(process.env.UPLOAD_MAX_FILE_COUNT, DEFAULT_UPLOAD_MAX_FILE_COUNT, 'UPLOAD_MAX_FILE_COUNT'),
+  maxFileCount: parsePositiveIntegerEnv(env[ENV.uploadMaxFileCount], DEFAULT_UPLOAD_MAX_FILE_COUNT, ENV.uploadMaxFileCount),
   maxFileSizeBytes: parseMegabyteSizeEnv(
-    process.env.UPLOAD_MAX_FILE_SIZE,
+    env[ENV.uploadMaxFileSize],
     DEFAULT_UPLOAD_MAX_FILE_SIZE_BYTES,
-    'UPLOAD_MAX_FILE_SIZE'
+    ENV.uploadMaxFileSize
   ),
   maxTotalSizeBytes: parseMegabyteSizeEnv(
-    process.env.UPLOAD_MAX_TOTAL_SIZE,
+    env[ENV.uploadMaxTotalSize],
     DEFAULT_UPLOAD_MAX_TOTAL_SIZE_BYTES,
-    'UPLOAD_MAX_TOTAL_SIZE'
+    ENV.uploadMaxTotalSize
   )
 }
 
 if (uploadLimits.maxTotalSizeBytes < uploadLimits.maxFileSizeBytes) {
-  throw new Error('环境变量 UPLOAD_MAX_TOTAL_SIZE 不能小于 UPLOAD_MAX_FILE_SIZE')
+  throw new Error(`环境变量 ${ENV.uploadMaxTotalSize} 不能小于 ${ENV.uploadMaxFileSize}`)
 }
 
-const resultTtlMs = parsePositiveIntegerEnv(process.env.RESULT_TTL_SECONDS, 300, 'RESULT_TTL_SECONDS') * 1000
-const resultStorageMaxBytes = parseMegabyteSizeEnv(process.env.RESULT_STORAGE_MAX_SIZE, 256 * MEGABYTE, 'RESULT_STORAGE_MAX_SIZE')
-const resultStorageDir = process.env.RESULT_STORAGE_DIR?.trim() || undefined
+const resultTtlMs = parsePositiveIntegerEnv(env[ENV.resultTtlSeconds], 300, ENV.resultTtlSeconds) * 1000
+const resultStorageMaxBytes = parseMegabyteSizeEnv(env[ENV.resultStorageMaxSize], 256 * MEGABYTE, ENV.resultStorageMaxSize)
+const resultStorageDir = env[ENV.resultStorageDir]?.trim() || undefined
 const normalizedPublicBaseUrl = normalizeBaseUrl(publicBaseUrl)
 const bodyLimit = uploadLimits.maxTotalSizeBytes + MULTIPART_BODY_OVERHEAD_BYTES
 
