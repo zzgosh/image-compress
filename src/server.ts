@@ -1,8 +1,12 @@
 import multipart from '@fastify/multipart'
 import Fastify from 'fastify'
+import { ImageProcessor } from './lib/compress.js'
+import { RequestGate } from './lib/request-gate.js'
 import { EphemeralResultStore } from './lib/result-store.js'
 import { MEGABYTE, formatMegabyteSize } from './lib/size.js'
+import { UploadStagingStore } from './lib/upload-staging-store.js'
 import {
+  DEFAULT_PROCESSING_CONCURRENCY,
   DEFAULT_UPLOAD_MAX_FILE_COUNT,
   DEFAULT_UPLOAD_MAX_FILE_SIZE_BYTES,
   DEFAULT_UPLOAD_MAX_TOTAL_SIZE_BYTES,
@@ -15,11 +19,16 @@ import { HttpError } from './types/api.js'
 const ENV = {
   apiTokens: 'IMAGE_COMPRESS_API_TOKENS',
   host: 'IMAGE_COMPRESS_API_HOST',
+  maxActiveRequests: 'IMAGE_COMPRESS_API_MAX_ACTIVE_REQUESTS',
+  maxQueuedRequests: 'IMAGE_COMPRESS_API_MAX_QUEUED_REQUESTS',
   port: 'IMAGE_COMPRESS_API_PORT',
+  processingConcurrency: 'IMAGE_COMPRESS_API_PROCESSING_CONCURRENCY',
   publicBaseUrl: 'IMAGE_COMPRESS_API_PUBLIC_BASE_URL',
   resultStorageDir: 'IMAGE_COMPRESS_API_RESULT_STORAGE_DIR',
   resultStorageMaxSize: 'IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE',
   resultTtlSeconds: 'IMAGE_COMPRESS_API_RESULT_TTL_SECONDS',
+  uploadStagingDir: 'IMAGE_COMPRESS_API_UPLOAD_STAGING_DIR',
+  uploadStagingMaxSize: 'IMAGE_COMPRESS_API_UPLOAD_STAGING_MAX_SIZE',
   uploadMaxFileCount: 'IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT',
   uploadMaxFileSize: 'IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_SIZE',
   uploadMaxTotalSize: 'IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE'
@@ -45,6 +54,24 @@ const parsePositiveIntegerEnv = (rawValue: string | undefined, defaultValue: num
   const parsed = Number.parseInt(trimmed, 10)
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new Error(`环境变量 ${envName} 必须是正整数`)
+  }
+
+  return parsed
+}
+
+const parseNonNegativeIntegerEnv = (rawValue: string | undefined, defaultValue: number, envName: string): number => {
+  if (!rawValue) {
+    return defaultValue
+  }
+
+  const trimmed = rawValue.trim()
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`环境变量 ${envName} 必须是非负整数`)
+  }
+
+  const parsed = Number.parseInt(trimmed, 10)
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`环境变量 ${envName} 必须是非负整数`)
   }
 
   return parsed
@@ -109,12 +136,17 @@ const parseApiTokens = (rawValue: string | undefined): string[] => {
 
 const legacyEnvRenames: Array<[legacyEnvName: string, replacementEnvName: string]> = [
   ['HOST', ENV.host],
+  ['MAX_ACTIVE_REQUESTS', ENV.maxActiveRequests],
+  ['MAX_QUEUED_REQUESTS', ENV.maxQueuedRequests],
   ['PORT', ENV.port],
+  ['PROCESSING_CONCURRENCY', ENV.processingConcurrency],
   ['PUBLIC_BASE_URL', ENV.publicBaseUrl],
   ['RESULT_STORAGE_DIR', ENV.resultStorageDir],
   ['RESULT_STORAGE_MAX_BYTES', ENV.resultStorageMaxSize],
   ['RESULT_STORAGE_MAX_SIZE', ENV.resultStorageMaxSize],
   ['RESULT_TTL_SECONDS', ENV.resultTtlSeconds],
+  ['UPLOAD_STAGING_DIR', ENV.uploadStagingDir],
+  ['UPLOAD_STAGING_MAX_SIZE', ENV.uploadStagingMaxSize],
   ['UPLOAD_MAX_FILE_COUNT', ENV.uploadMaxFileCount],
   ['UPLOAD_MAX_FILE_SIZE', ENV.uploadMaxFileSize],
   ['UPLOAD_MAX_TOTAL_SIZE', ENV.uploadMaxTotalSize]
@@ -145,19 +177,42 @@ if (uploadLimits.maxTotalSizeBytes < uploadLimits.maxFileSizeBytes) {
 }
 
 const resultTtlMs = parsePositiveIntegerEnv(env[ENV.resultTtlSeconds], 300, ENV.resultTtlSeconds) * 1000
+const processingConcurrency = parsePositiveIntegerEnv(
+  env[ENV.processingConcurrency],
+  DEFAULT_PROCESSING_CONCURRENCY,
+  ENV.processingConcurrency
+)
+const maxActiveRequests = parseNonNegativeIntegerEnv(env[ENV.maxActiveRequests], 0, ENV.maxActiveRequests)
+const maxQueuedRequests = parseNonNegativeIntegerEnv(env[ENV.maxQueuedRequests], 0, ENV.maxQueuedRequests)
 const resultStorageMaxBytes = parseMegabyteSizeEnv(env[ENV.resultStorageMaxSize], 256 * MEGABYTE, ENV.resultStorageMaxSize)
 const resultStorageDir = env[ENV.resultStorageDir]?.trim() || undefined
+const uploadStagingDir = env[ENV.uploadStagingDir]?.trim() || undefined
+const uploadStagingMaxBytes =
+  env[ENV.uploadStagingMaxSize]?.trim() ? parseMegabyteSizeEnv(env[ENV.uploadStagingMaxSize], 0, ENV.uploadStagingMaxSize) : undefined
 const normalizedPublicBaseUrl = normalizeBaseUrl(publicBaseUrl)
 const bodyLimit = uploadLimits.maxTotalSizeBytes + MULTIPART_BODY_OVERHEAD_BYTES
+
+if (maxActiveRequests === 0 && maxQueuedRequests > 0) {
+  throw new Error(`环境变量 ${ENV.maxQueuedRequests} 需要配合 ${ENV.maxActiveRequests} 一起使用`)
+}
 
 const app = Fastify({
   logger: true,
   bodyLimit
 })
+const imageProcessor = new ImageProcessor(processingConcurrency)
+const requestGate = new RequestGate({
+  maxActiveRequests,
+  maxQueuedRequests
+})
 const resultStore = new EphemeralResultStore({
   ttlMs: resultTtlMs,
   maxTotalBytes: resultStorageMaxBytes,
   storageDir: resultStorageDir
+})
+const uploadStagingStore = new UploadStagingStore({
+  storageDir: uploadStagingDir,
+  maxTotalBytes: uploadStagingMaxBytes
 })
 
 app.register(multipart)
@@ -173,19 +228,28 @@ app.get(`${apiBasePath}/healthz`, async () => {
 app.register(compressRoutes, {
   apiTokens,
   apiBasePath,
+  imageProcessor,
   publicBaseUrl: normalizedPublicBaseUrl,
+  requestGate,
   resultStore,
   uploadLimits,
+  uploadStagingStore,
   prefix: apiBasePath
 })
 app.register(resultRoutes, { resultStore, prefix: apiBasePath })
 
 app.addHook('onClose', async () => {
   await resultStore.close()
+  await uploadStagingStore.close()
 })
 
 app.setErrorHandler((error, request, reply) => {
   if (error instanceof HttpError) {
+    if (error.headers) {
+      for (const [headerName, headerValue] of Object.entries(error.headers)) {
+        reply.header(headerName, headerValue)
+      }
+    }
     reply.status(error.statusCode).send(error.toPayload())
     return
   }
@@ -231,6 +295,7 @@ app.setErrorHandler((error, request, reply) => {
 const start = async (): Promise<void> => {
   try {
     await resultStore.init()
+    await uploadStagingStore.init()
     await app.listen({ port, host })
 
     let isClosing = false

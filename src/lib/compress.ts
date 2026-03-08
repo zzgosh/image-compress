@@ -1,7 +1,8 @@
+import { readFile } from 'node:fs/promises'
 import pLimit from 'p-limit'
 import sharp from 'sharp'
 import { HttpError, type CompressedImageResult, type UploadedImage } from '../types/api.js'
-import { MAX_IMAGE_PIXELS, PROCESSING_CONCURRENCY } from './validate.js'
+import { DEFAULT_PROCESSING_CONCURRENCY, MAX_IMAGE_PIXELS } from './validate.js'
 
 type SupportedImageFormat = 'jpg' | 'png' | 'webp'
 
@@ -31,7 +32,8 @@ const PNG_PALETTE_QUALITY = 75
 const PNG_PALETTE_EFFORT = 7
 const PNG_PALETTE_DITHER = 0
 
-const globalLimit = pLimit(PROCESSING_CONCURRENCY)
+const resolveSharpInput = (file: UploadedImage): Buffer | string =>
+  file.source.kind === 'buffer' ? file.source.buffer : file.source.filePath
 
 const splitFileName = (fileName: string): { baseName: string; extension: string } => {
   const lastDotIndex = fileName.lastIndexOf('.')
@@ -57,11 +59,11 @@ const buildOutputFileName = (sourceFileName: string, format: SupportedImageForma
   return `${normalizedBase}.${OUTPUT_FORMAT_TO_EXTENSION[format]}`
 }
 
-const createPipeline = (inputBuffer: Buffer): sharp.Sharp =>
-  sharp(inputBuffer, { failOn: 'warning', limitInputPixels: MAX_IMAGE_PIXELS }).rotate()
+const createPipeline = (file: UploadedImage): sharp.Sharp =>
+  sharp(resolveSharpInput(file), { failOn: 'warning', limitInputPixels: MAX_IMAGE_PIXELS }).rotate()
 
-const encodeImage = async (inputBuffer: Buffer, format: SupportedImageFormat): Promise<Buffer> => {
-  const pipeline = createPipeline(inputBuffer)
+const encodeImage = async (file: UploadedImage, format: SupportedImageFormat): Promise<Buffer> => {
+  const pipeline = createPipeline(file)
 
   if (format === 'jpg') {
     return pipeline.jpeg({ quality: JPEG_QUALITY, mozjpeg: true }).toBuffer()
@@ -76,10 +78,10 @@ const encodeImage = async (inputBuffer: Buffer, format: SupportedImageFormat): P
   return pipeline.png({ quality: PNG_PALETTE_QUALITY, effort: PNG_PALETTE_EFFORT, dither: PNG_PALETTE_DITHER }).toBuffer()
 }
 
-const detectSourceInfo = async (inputBuffer: Buffer): Promise<{ format: SupportedImageFormat; needsRotate: boolean }> => {
+const detectSourceInfo = async (file: UploadedImage): Promise<{ format: SupportedImageFormat; needsRotate: boolean }> => {
   let metadata: sharp.Metadata
   try {
-    metadata = await sharp(inputBuffer, { failOn: 'warning', limitInputPixels: MAX_IMAGE_PIXELS }).metadata()
+    metadata = await sharp(resolveSharpInput(file), { failOn: 'warning', limitInputPixels: MAX_IMAGE_PIXELS }).metadata()
   } catch (error) {
     const message = (error as Error)?.message ?? ''
     if (message.includes('pixel limit')) {
@@ -106,12 +108,12 @@ const detectSourceInfo = async (inputBuffer: Buffer): Promise<{ format: Supporte
 }
 
 const compressSingleImage = async (file: UploadedImage): Promise<CompressedImageResult> => {
-  const source = await detectSourceInfo(file.buffer)
+  const source = await detectSourceInfo(file)
   const sourceFormat = source.format
 
   let outputBuffer: Buffer
   try {
-    outputBuffer = await encodeImage(file.buffer, sourceFormat)
+    outputBuffer = await encodeImage(file, sourceFormat)
   } catch (error) {
     const message = (error as Error)?.message ?? ''
     if (message.includes('pixel limit')) {
@@ -127,7 +129,8 @@ const compressSingleImage = async (file: UploadedImage): Promise<CompressedImage
   // 统一启用“变大回退原图”，避免再编码导致体积增长。
   // 例外：当输入包含 EXIF Orientation 时，优先保证输出方向正确，不回退到原图。
   if (outputBuffer.length >= file.byteLength && !source.needsRotate) {
-    outputBuffer = file.buffer
+    outputBuffer =
+      file.source.kind === 'buffer' ? file.source.buffer : await readFile(file.source.filePath)
     usedFallback = true
     outputFileName = file.fileName
   }
@@ -144,5 +147,19 @@ const compressSingleImage = async (file: UploadedImage): Promise<CompressedImage
   }
 }
 
+export class ImageProcessor {
+  private readonly limit: ReturnType<typeof pLimit>
+
+  constructor(concurrency = DEFAULT_PROCESSING_CONCURRENCY) {
+    this.limit = pLimit(concurrency)
+  }
+
+  async compressImages(files: UploadedImage[]): Promise<CompressedImageResult[]> {
+    return Promise.all(files.map((file) => this.limit(() => compressSingleImage(file))))
+  }
+}
+
+const defaultProcessor = new ImageProcessor()
+
 export const compressImages = async (files: UploadedImage[]): Promise<CompressedImageResult[]> =>
-  Promise.all(files.map((file) => globalLimit(() => compressSingleImage(file))))
+  defaultProcessor.compressImages(files)

@@ -135,6 +135,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiErrorPayload'
+        '503':
+          description: Server-side request capacity is exhausted. Retry after the indicated delay.
+          headers:
+            Retry-After:
+              schema:
+                type: string
+              description: Suggested retry delay in seconds.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorPayload'
         '500':
           description: Internal error.
           content:
@@ -142,7 +153,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiErrorPayload'
         '507':
-          description: Temporary result storage is full.
+          description: Temporary upload staging or result storage is full.
           content:
             application/json:
               schema:
@@ -230,6 +241,7 @@ components:
         - PROCESSING_FAILED
         - NOT_FOUND
         - INSUFFICIENT_STORAGE
+        - SERVICE_UNAVAILABLE
         - INTERNAL_ERROR
     ApiErrorPayload:
       type: object

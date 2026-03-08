@@ -6,6 +6,7 @@ export type ApiErrorCode =
   | 'PROCESSING_FAILED'
   | 'NOT_FOUND'
   | 'INSUFFICIENT_STORAGE'
+  | 'SERVICE_UNAVAILABLE'
   | 'INTERNAL_ERROR'
 
 export interface ApiErrorPayload {
@@ -15,8 +16,18 @@ export interface ApiErrorPayload {
   }
 }
 
+export type UploadedImageSource =
+  | {
+      kind: 'buffer'
+      buffer: Buffer
+    }
+  | {
+      kind: 'file'
+      filePath: string
+    }
+
 export interface UploadedImage {
-  buffer: Buffer
+  source: UploadedImageSource
   fileName: string
   byteLength: number
 }
@@ -35,12 +46,14 @@ export interface CompressedImageResult {
 export class HttpError extends Error {
   statusCode: number
   code: ApiErrorCode
+  headers?: Record<string, string>
 
-  constructor(statusCode: number, code: ApiErrorCode, message: string) {
+  constructor(statusCode: number, code: ApiErrorCode, message: string, options?: { headers?: Record<string, string> }) {
     super(message)
     this.name = 'HttpError'
     this.statusCode = statusCode
     this.code = code
+    this.headers = options?.headers
   }
 
   toPayload(): ApiErrorPayload {
