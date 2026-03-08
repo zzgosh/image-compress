@@ -75,6 +75,7 @@ EOF
 - `RESULT_TTL_SECONDS` 是临时结果的保留时长
 - `RESULT_STORAGE_MAX_SIZE` 是服务端临时结果目录的总存储上限
 - 容量型环境变量支持原始字节整数，或使用大写 `MB` 后缀，例如 `20MB`、`80MB`、`256MB`
+- 整数型环境变量只接受纯数字，例如 `RESULT_TTL_SECONDS=300`、`UPLOAD_MAX_FILE_COUNT=30`
 
 ### 3) 类型检查 + 构建 + 启动
 

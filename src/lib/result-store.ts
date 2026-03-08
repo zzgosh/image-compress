@@ -57,6 +57,7 @@ export interface ClaimedResult {
 }
 
 const DEFAULT_STORAGE_DIR = path.join(tmpdir(), 'image-compress-api-results')
+const DEFAULT_STAGING_DIR = path.join(tmpdir(), 'image-compress-api-result-store-staging')
 const DEFAULT_CLEANUP_INTERVAL_MS = 30_000
 const STORE_MARKER_FILE_NAME = '.image-compress-result-store'
 const MANAGED_RESULT_FILE_PATTERN = /^result-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(bin|tmp)$/i
@@ -77,6 +78,7 @@ const resultNotFound = (): HttpError => new HttpError(404, 'NOT_FOUND', 'result 
 export class EphemeralResultStore {
   private readonly entries = new Map<string, StoredResult>()
   private readonly storageDir: string
+  private readonly stagingDir: string
   private readonly ttlMs: number
   private readonly maxTotalBytes: number
   private readonly now: () => number
@@ -87,6 +89,7 @@ export class EphemeralResultStore {
 
   constructor(options: ResultStoreOptions) {
     this.storageDir = options.storageDir ?? DEFAULT_STORAGE_DIR
+    this.stagingDir = DEFAULT_STAGING_DIR
     this.ttlMs = options.ttlMs
     this.maxTotalBytes = options.maxTotalBytes
     this.now = options.now ?? (() => Date.now())
@@ -96,10 +99,12 @@ export class EphemeralResultStore {
   async init(): Promise<void> {
     await this.runExclusive(async () => {
       await fs.mkdir(this.storageDir, { recursive: true })
+      await fs.mkdir(this.stagingDir, { recursive: true })
       await fs.writeFile(path.join(this.storageDir, STORE_MARKER_FILE_NAME), 'image-compress-result-store\n')
       this.entries.clear()
       this.totalBytes = 0
-      await this.removeManagedArtifacts()
+      await this.removeManagedArtifacts(this.storageDir)
+      await this.removeManagedArtifacts(this.stagingDir)
     })
 
     this.cleanupTimer = setInterval(() => {
@@ -122,7 +127,8 @@ export class EphemeralResultStore {
 
       this.entries.clear()
       this.totalBytes = 0
-      await this.removeManagedArtifacts()
+      await this.removeManagedArtifacts(this.storageDir)
+      await this.removeManagedArtifacts(this.stagingDir)
     })
   }
 
@@ -133,7 +139,10 @@ export class EphemeralResultStore {
       const id = randomUUID()
       const token = randomBytes(24).toString('base64url')
       const finalPath = path.join(this.storageDir, this.buildManagedFileName(id, 'bin'))
-      const tempPath = path.join(this.storageDir, this.buildManagedFileName(id, 'tmp'))
+      const tempPath =
+        input.type === 'single'
+          ? path.join(this.storageDir, this.buildManagedFileName(id, 'tmp'))
+          : path.join(this.stagingDir, this.buildManagedFileName(id, 'tmp'))
 
       let byteLength = 0
 
@@ -149,7 +158,7 @@ export class EphemeralResultStore {
           this.assertStorageCapacity(byteLength)
         }
 
-        await fs.rename(tempPath, finalPath)
+        await this.moveFile(tempPath, finalPath)
 
         const expiresAt = this.now() + this.ttlMs
         this.entries.set(id, {
@@ -277,10 +286,23 @@ export class EphemeralResultStore {
     }
   }
 
-  private async removeManagedArtifacts(): Promise<void> {
+  private async moveFile(sourcePath: string, destinationPath: string): Promise<void> {
+    try {
+      await fs.rename(sourcePath, destinationPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EXDEV') {
+        throw error
+      }
+
+      await fs.copyFile(sourcePath, destinationPath)
+      await fs.rm(sourcePath, { force: true })
+    }
+  }
+
+  private async removeManagedArtifacts(directoryPath: string): Promise<void> {
     let entries
     try {
-      entries = await fs.readdir(this.storageDir, { withFileTypes: true })
+      entries = await fs.readdir(directoryPath, { withFileTypes: true })
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return
@@ -298,7 +320,7 @@ export class EphemeralResultStore {
           return
         }
 
-        await fs.rm(path.join(this.storageDir, entry.name), { force: true })
+        await fs.rm(path.join(directoryPath, entry.name), { force: true })
       })
     )
   }

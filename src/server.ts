@@ -23,7 +23,12 @@ const parsePositiveIntegerEnv = (rawValue: string | undefined, defaultValue: num
     return defaultValue
   }
 
-  const parsed = Number.parseInt(rawValue, 10)
+  const trimmed = rawValue.trim()
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`环境变量 ${envName} 必须是正整数`)
+  }
+
+  const parsed = Number.parseInt(trimmed, 10)
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new Error(`环境变量 ${envName} 必须是正整数`)
   }

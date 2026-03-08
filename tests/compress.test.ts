@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, readdir, rm as removeFileSystemEntry, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -452,6 +453,28 @@ test('result store serializes concurrent creates so the storage cap cannot be ov
   assert.ok(rejectedResults[0].reason instanceof HttpError)
   assert.equal(rejectedResults[0].reason.statusCode, 507)
   assert.equal(rejectedResults[0].reason.code, 'INSUFFICIENT_STORAGE')
+})
+
+test('server rejects integer env vars with non-numeric suffixes', () => {
+  const invalidCases = [
+    ['RESULT_TTL_SECONDS', '10foo'],
+    ['UPLOAD_MAX_FILE_COUNT', '1e3']
+  ] as const
+
+  for (const [envName, envValue] of invalidCases) {
+    const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        IMAGE_COMPRESS_API_TOKENS: 'test-token',
+        [envName]: envValue
+      },
+      encoding: 'utf8'
+    })
+
+    assert.notEqual(result.status, 0, `${envName} should fail startup`)
+    assert.match(`${result.stderr}${result.stdout}`, new RegExp(envName), envName)
+  }
 })
 
 test('compress route returns metadata and a one-time download URL for single file output', async (t) => {
