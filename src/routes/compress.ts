@@ -1,8 +1,10 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { assertAuthorized } from '../lib/auth.js'
-import { compressImages } from '../lib/compress.js'
+import { ImageProcessor } from '../lib/compress.js'
+import { RequestGate } from '../lib/request-gate.js'
 import { EphemeralResultStore } from '../lib/result-store.js'
 import { formatMegabyteSize } from '../lib/size.js'
+import { type StagedUpload, UploadStagingStore } from '../lib/upload-staging-store.js'
 import {
   normalizeZipName,
   sanitizeFileName,
@@ -15,8 +17,11 @@ interface CompressRoutesOptions {
   apiTokens: string[]
   apiBasePath: string
   publicBaseUrl?: string
+  imageProcessor: ImageProcessor
+  requestGate: RequestGate
   resultStore: EphemeralResultStore
   uploadLimits: UploadLimits
+  uploadStagingStore: UploadStagingStore
 }
 
 type CompressOutcome = 'compressed' | 'fallback_original'
@@ -105,170 +110,207 @@ const compressRoutes: FastifyPluginAsync<CompressRoutesOptions> = async (app, op
       throw new HttpError(400, 'INVALID_ARGUMENT', 'responseMode is no longer supported; use the JSON download flow')
     }
 
+    const permit = await options.requestGate.acquire()
     const fields: Record<string, string> = {}
     const files: UploadedImage[] = []
+    const stagedUploads: StagedUpload[] = []
     let totalBytes = 0
     let fileIndex = 0
     let firstError: HttpError | undefined
 
-    const parts = request.parts({
-      limits: {
-        files: options.uploadLimits.maxFileCount,
-        fileSize: options.uploadLimits.maxFileSizeBytes,
-        fields: 20
+    try {
+      const parts = request.parts({
+        limits: {
+          files: options.uploadLimits.maxFileCount,
+          fileSize: options.uploadLimits.maxFileSizeBytes,
+          fields: 20
+        }
+      })
+
+      for await (const part of parts) {
+        if (part.type === 'file') {
+          // 如果已经判定请求无效，继续把 multipart 流读完，避免请求悬挂。
+          if (firstError) {
+            await drainReadable(part.file)
+            continue
+          }
+
+          if (part.fieldname !== 'files') {
+            firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'file field name must be files')
+            await drainReadable(part.file)
+            continue
+          }
+
+          let fileSizeLimitExceeded = false
+          part.file.once('limit', () => {
+            fileSizeLimitExceeded = true
+          })
+
+          let stagedUpload: StagedUpload
+          try {
+            stagedUpload = await options.uploadStagingStore.stage(part.file)
+          } catch (error) {
+            if (error instanceof HttpError) {
+              firstError ??= error
+              continue
+            }
+            throw error
+          }
+
+          if (fileSizeLimitExceeded || (part.file as NodeJS.ReadableStream & { truncated?: boolean }).truncated) {
+            await stagedUpload.cleanup()
+            firstError ??= new HttpError(
+              413,
+              'PAYLOAD_TOO_LARGE',
+              `single file size exceeds ${formatMegabyteSize(options.uploadLimits.maxFileSizeBytes)}`
+            )
+            continue
+          }
+
+          totalBytes += stagedUpload.byteLength
+          if (totalBytes > options.uploadLimits.maxTotalSizeBytes) {
+            await stagedUpload.cleanup()
+            firstError ??= new HttpError(
+              413,
+              'PAYLOAD_TOO_LARGE',
+              `total upload size exceeds ${formatMegabyteSize(options.uploadLimits.maxTotalSizeBytes)}`
+            )
+            continue
+          }
+
+          fileIndex += 1
+          const fallbackName = `image_${fileIndex}`
+          const fileName = sanitizeFileName(part.filename ?? '', fallbackName)
+
+          stagedUploads.push(stagedUpload)
+          files.push({
+            source: {
+              kind: 'file',
+              filePath: stagedUpload.filePath
+            },
+            fileName,
+            byteLength: stagedUpload.byteLength
+          })
+        } else {
+          const value = normalizeFieldValue(part.value)
+
+          if (part.fieldname === 'zipName') {
+            fields.zipName = value
+            continue
+          }
+
+          if (part.fieldname === 'responseMode') {
+            firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'responseMode is no longer supported; use the JSON download flow')
+            continue
+          }
+
+          if (part.fieldname === 'quality' || part.fieldname === 'targetFormat' || part.fieldname === 'output') {
+            firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'quality/targetFormat/output are not supported')
+            continue
+          }
+
+          firstError ??= new HttpError(400, 'INVALID_ARGUMENT', `unsupported field: ${part.fieldname}`)
+        }
       }
-    })
 
-    for await (const part of parts) {
-      if (part.type === 'file') {
-        // 如果已经判定请求无效，继续把 multipart 流读完，避免请求悬挂。
-        if (firstError) {
-          await drainReadable(part.file)
-          continue
+      if (firstError) {
+        throw firstError
+      }
+
+      if (files.length === 0) {
+        throw new HttpError(400, 'INVALID_ARGUMENT', 'files is required')
+      }
+
+      const compressedFiles = await options.imageProcessor.compressImages(files)
+      const outputFiles = compressedFiles.length === 1 ? compressedFiles : withUniqueZipEntryNames(compressedFiles)
+
+      const originalBytes = sumBytes(files.map((file) => file.byteLength))
+      const outputBytes = sumBytes(compressedFiles.map((file) => file.compressedBytes))
+      const savedBytes = originalBytes - outputBytes
+      const compressionRatio = originalBytes > 0 ? savedBytes / originalBytes : 0
+
+      const { compressed, outcome, reason } = resolveResponseOutcome(compressedFiles)
+      const outputType = outputFiles.length === 1 ? ('single' as const) : ('zip' as const)
+      const singleOutputFile = outputType === 'single' ? outputFiles[0] : undefined
+      let outputMimeType: string
+      let outputFileName: string
+
+      let storedResult
+      if (outputType === 'single') {
+        if (!singleOutputFile) {
+          throw new HttpError(500, 'INTERNAL_ERROR', 'compressed output is empty')
         }
 
-        if (part.fieldname !== 'files') {
-          firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'file field name must be files')
-          await drainReadable(part.file)
-          continue
-        }
-
-        const fileBuffer = await part.toBuffer()
-        totalBytes += fileBuffer.length
-        if (totalBytes > options.uploadLimits.maxTotalSizeBytes) {
-          firstError ??= new HttpError(
-            413,
-            'PAYLOAD_TOO_LARGE',
-            `total upload size exceeds ${formatMegabyteSize(options.uploadLimits.maxTotalSizeBytes)}`
-          )
-          continue
-        }
-
-        fileIndex += 1
-        const fallbackName = `image_${fileIndex}`
-        const fileName = sanitizeFileName(part.filename ?? '', fallbackName)
-
-        files.push({
-          buffer: fileBuffer,
-          fileName,
-          byteLength: fileBuffer.length
+        outputMimeType = singleOutputFile.outputMimeType
+        outputFileName = singleOutputFile.fileName
+        storedResult = await options.resultStore.create({
+          type: 'single',
+          fileName: outputFileName,
+          mimeType: outputMimeType,
+          buffer: singleOutputFile.buffer
         })
       } else {
-        const value = normalizeFieldValue(part.value)
-
-        if (part.fieldname === 'zipName') {
-          fields.zipName = value
-          continue
-        }
-
-        if (part.fieldname === 'responseMode') {
-          firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'responseMode is no longer supported; use the JSON download flow')
-          continue
-        }
-
-        if (part.fieldname === 'quality' || part.fieldname === 'targetFormat' || part.fieldname === 'output') {
-          firstError ??= new HttpError(400, 'INVALID_ARGUMENT', 'quality/targetFormat/output are not supported')
-          continue
-        }
-
-        firstError ??= new HttpError(400, 'INVALID_ARGUMENT', `unsupported field: ${part.fieldname}`)
-      }
-    }
-
-    if (firstError) {
-      throw firstError
-    }
-
-    if (files.length === 0) {
-      throw new HttpError(400, 'INVALID_ARGUMENT', 'files is required')
-    }
-
-    const compressedFiles = await compressImages(files)
-    const outputFiles = compressedFiles.length === 1 ? compressedFiles : withUniqueZipEntryNames(compressedFiles)
-
-    const originalBytes = sumBytes(files.map((file) => file.byteLength))
-    const outputBytes = sumBytes(compressedFiles.map((file) => file.compressedBytes))
-    const savedBytes = originalBytes - outputBytes
-    const compressionRatio = originalBytes > 0 ? savedBytes / originalBytes : 0
-
-    const { compressed, outcome, reason } = resolveResponseOutcome(compressedFiles)
-    const outputType = outputFiles.length === 1 ? ('single' as const) : ('zip' as const)
-    const singleOutputFile = outputType === 'single' ? outputFiles[0] : undefined
-    let outputMimeType: string
-    let outputFileName: string
-
-    let storedResult
-    if (outputType === 'single') {
-      if (!singleOutputFile) {
-        throw new HttpError(500, 'INTERNAL_ERROR', 'compressed output is empty')
+        outputMimeType = 'application/zip'
+        outputFileName = normalizeZipName(fields.zipName)
+        storedResult = await options.resultStore.create({
+          type: 'zip',
+          fileName: outputFileName,
+          mimeType: 'application/zip',
+          files: outputFiles
+        })
       }
 
-      outputMimeType = singleOutputFile.outputMimeType
-      outputFileName = singleOutputFile.fileName
-      storedResult = await options.resultStore.create({
-        type: 'single',
-        fileName: outputFileName,
-        mimeType: outputMimeType,
-        buffer: singleOutputFile.buffer
+      const downloadUrl = buildDownloadUrl(
+        request.headers.host,
+        Array.isArray(request.headers['x-forwarded-host']) ? request.headers['x-forwarded-host'][0] : request.headers['x-forwarded-host'],
+        Array.isArray(request.headers['x-forwarded-proto']) ? request.headers['x-forwarded-proto'][0] : request.headers['x-forwarded-proto'],
+        options.publicBaseUrl,
+        options.apiBasePath,
+        storedResult.id,
+        storedResult.token
+      )
+
+      return reply.send({
+        success: true,
+        compressed,
+        outcome,
+        reason,
+        originalBytes,
+        outputBytes,
+        savedBytes,
+        compressionRatio,
+        outputType,
+        outputMimeType,
+        outputFileName,
+        fileCount: files.length,
+        download: {
+          url: downloadUrl,
+          expiresAt: storedResult.expiresAt,
+          singleUse: true
+        },
+        results: outputFiles.map((file) => {
+          const { compressed: fileCompressed, outcome: fileOutcome, reason: fileReason } = resolveFileOutcome(file)
+          const fileSavedBytes = file.originalBytes - file.compressedBytes
+          const fileCompressionRatio = file.originalBytes > 0 ? fileSavedBytes / file.originalBytes : 0
+
+          return {
+            originalFileName: file.sourceFileName,
+            outputFileName: file.fileName,
+            outputMimeType: file.outputMimeType,
+            compressed: fileCompressed,
+            outcome: fileOutcome,
+            reason: fileReason,
+            originalBytes: file.originalBytes,
+            outputBytes: file.compressedBytes,
+            savedBytes: fileSavedBytes,
+            compressionRatio: fileCompressionRatio
+          }
+        })
       })
-    } else {
-      outputMimeType = 'application/zip'
-      outputFileName = normalizeZipName(fields.zipName)
-      storedResult = await options.resultStore.create({
-        type: 'zip',
-        fileName: outputFileName,
-        mimeType: 'application/zip',
-        files: outputFiles
-      })
+    } finally {
+      await Promise.allSettled(stagedUploads.map((upload) => upload.cleanup()))
+      permit.release()
     }
-
-    const downloadUrl = buildDownloadUrl(
-      request.headers.host,
-      Array.isArray(request.headers['x-forwarded-host']) ? request.headers['x-forwarded-host'][0] : request.headers['x-forwarded-host'],
-      Array.isArray(request.headers['x-forwarded-proto']) ? request.headers['x-forwarded-proto'][0] : request.headers['x-forwarded-proto'],
-      options.publicBaseUrl,
-      options.apiBasePath,
-      storedResult.id,
-      storedResult.token
-    )
-
-    return reply.send({
-      success: true,
-      compressed,
-      outcome,
-      reason,
-      originalBytes,
-      outputBytes,
-      savedBytes,
-      compressionRatio,
-      outputType,
-      outputMimeType,
-      outputFileName,
-      fileCount: files.length,
-      download: {
-        url: downloadUrl,
-        expiresAt: storedResult.expiresAt,
-        singleUse: true
-      },
-      results: outputFiles.map((file) => {
-        const { compressed: fileCompressed, outcome: fileOutcome, reason: fileReason } = resolveFileOutcome(file)
-        const fileSavedBytes = file.originalBytes - file.compressedBytes
-        const fileCompressionRatio = file.originalBytes > 0 ? fileSavedBytes / file.originalBytes : 0
-
-        return {
-          originalFileName: file.sourceFileName,
-          outputFileName: file.fileName,
-          outputMimeType: file.outputMimeType,
-          compressed: fileCompressed,
-          outcome: fileOutcome,
-          reason: fileReason,
-          originalBytes: file.originalBytes,
-          outputBytes: file.compressedBytes,
-          savedBytes: fileSavedBytes,
-          compressionRatio: fileCompressionRatio
-        }
-      })
-    })
   })
 }
 

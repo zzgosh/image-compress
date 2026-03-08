@@ -3,15 +3,19 @@ import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, readdir, rm as removeFileSystemEntry, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { Readable } from 'node:stream'
 import { test } from 'node:test'
 import multipart from '@fastify/multipart'
 import Fastify from 'fastify'
 import sharp from 'sharp'
-import { compressImages } from '../src/lib/compress.ts'
+import { compressImages, ImageProcessor } from '../src/lib/compress.ts'
+import { RequestGate } from '../src/lib/request-gate.ts'
 import { EphemeralResultStore } from '../src/lib/result-store.ts'
 import { formatMegabyteSize } from '../src/lib/size.ts'
+import { UploadStagingStore } from '../src/lib/upload-staging-store.ts'
 import { createZipFile } from '../src/lib/zip.ts'
 import {
+  DEFAULT_PROCESSING_CONCURRENCY,
   DEFAULT_UPLOAD_MAX_FILE_COUNT,
   DEFAULT_UPLOAD_MAX_FILE_SIZE_BYTES,
   DEFAULT_UPLOAD_MAX_TOTAL_SIZE_BYTES
@@ -234,30 +238,51 @@ const createApp = async (options?: {
   now?: () => number
   ttlMs?: number
   maxTotalBytes?: number
+  maxActiveRequests?: number
+  maxQueuedRequests?: number
+  processingConcurrency?: number
+  uploadStagingMaxBytes?: number
   uploadLimits?: {
     maxFileCount?: number
     maxFileSizeBytes?: number
     maxTotalSizeBytes?: number
   }
 }) => {
-  const app = Fastify()
-  const resultStore = new EphemeralResultStore({
-    now: options?.now,
-    ttlMs: options?.ttlMs ?? 300_000,
-    maxTotalBytes: options?.maxTotalBytes ?? 256 * 1024 * 1024
-  })
   const uploadLimits = {
     maxFileCount: options?.uploadLimits?.maxFileCount ?? DEFAULT_UPLOAD_MAX_FILE_COUNT,
     maxFileSizeBytes: options?.uploadLimits?.maxFileSizeBytes ?? DEFAULT_UPLOAD_MAX_FILE_SIZE_BYTES,
     maxTotalSizeBytes: options?.uploadLimits?.maxTotalSizeBytes ?? DEFAULT_UPLOAD_MAX_TOTAL_SIZE_BYTES
   }
+  const app = Fastify({
+    bodyLimit: uploadLimits.maxTotalSizeBytes + 10 * 1024 * 1024
+  })
+  const imageProcessor = new ImageProcessor(options?.processingConcurrency ?? DEFAULT_PROCESSING_CONCURRENCY)
+  const requestGate = new RequestGate({
+    maxActiveRequests: options?.maxActiveRequests ?? 0,
+    maxQueuedRequests: options?.maxQueuedRequests ?? 0
+  })
+  const resultStore = new EphemeralResultStore({
+    now: options?.now,
+    ttlMs: options?.ttlMs ?? 300_000,
+    maxTotalBytes: options?.maxTotalBytes ?? 256 * 1024 * 1024
+  })
+  const uploadStagingStore = new UploadStagingStore({
+    maxTotalBytes: options?.uploadStagingMaxBytes
+  })
 
   await resultStore.init()
+  await uploadStagingStore.init()
   app.addHook('onClose', async () => {
     await resultStore.close()
+    await uploadStagingStore.close()
   })
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof HttpError) {
+      if (error.headers) {
+        for (const [headerName, headerValue] of Object.entries(error.headers)) {
+          reply.header(headerName, headerValue)
+        }
+      }
       reply.status(error.statusCode).send(error.toPayload())
       return
     }
@@ -302,9 +327,12 @@ const createApp = async (options?: {
   await app.register(compressRoutes, {
     apiTokens: ['test-token'],
     apiBasePath: API_BASE_PATH,
+    imageProcessor,
     publicBaseUrl: 'http://127.0.0.1:3001',
+    requestGate,
     resultStore,
     uploadLimits,
+    uploadStagingStore,
     prefix: API_BASE_PATH
   })
   await app.register(resultRoutes, {
@@ -351,7 +379,10 @@ test('compressImages keeps rotated JPEG output when EXIF normalization makes it 
   const candidate = await findLargerOrEqualOutputCandidate(true)
   const [result] = await compressImages([
     {
-      buffer: candidate.buffer,
+      source: {
+        kind: 'buffer',
+        buffer: candidate.buffer
+      },
       fileName: 'rotated.jpg',
       byteLength: candidate.buffer.length
     }
@@ -456,6 +487,32 @@ test('result store serializes concurrent creates so the storage cap cannot be ov
   assert.equal(rejectedResults[0].reason.code, 'INSUFFICIENT_STORAGE')
 })
 
+test('upload staging store rejects writes that exceed the configured storage cap', async (t) => {
+  const stagingStore = new UploadStagingStore({
+    maxTotalBytes: 4
+  })
+  t.after(async () => {
+    await stagingStore.close()
+  })
+
+  await stagingStore.init()
+
+  const staged = await stagingStore.stage(Readable.from(Buffer.from('1234')))
+  assert.equal(staged.byteLength, 4)
+
+  await assert.rejects(
+    () => stagingStore.stage(Readable.from(Buffer.from('5'))),
+    (error: unknown) => {
+      assert.ok(error instanceof HttpError)
+      assert.equal(error.statusCode, 507)
+      assert.equal(error.code, 'INSUFFICIENT_STORAGE')
+      return true
+    }
+  )
+
+  await staged.cleanup()
+})
+
 test('createZipFile preserves the unique entry names chosen by metadata generation', async (t) => {
   const storageDir = await createTempStorageDir()
   t.after(async () => {
@@ -498,7 +555,9 @@ test('createZipFile preserves the unique entry names chosen by metadata generati
 test('server rejects integer env vars with non-numeric suffixes', () => {
   const invalidCases = [
     ['IMAGE_COMPRESS_API_RESULT_TTL_SECONDS', '10foo'],
-    ['IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT', '1e3']
+    ['IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT', '1e3'],
+    ['IMAGE_COMPRESS_API_PROCESSING_CONCURRENCY', 'fast'],
+    ['IMAGE_COMPRESS_API_MAX_ACTIVE_REQUESTS', '-1']
   ] as const
 
   for (const [envName, envValue] of invalidCases) {
@@ -517,11 +576,28 @@ test('server rejects integer env vars with non-numeric suffixes', () => {
   }
 })
 
+test('server rejects queued request config without an active request limit', () => {
+  const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      IMAGE_COMPRESS_API_TOKENS: 'test-token',
+      IMAGE_COMPRESS_API_MAX_QUEUED_REQUESTS: '1'
+    },
+    encoding: 'utf8'
+  })
+
+  assert.notEqual(result.status, 0)
+  assert.match(`${result.stderr}${result.stdout}`, /IMAGE_COMPRESS_API_MAX_QUEUED_REQUESTS/)
+  assert.match(`${result.stderr}${result.stdout}`, /IMAGE_COMPRESS_API_MAX_ACTIVE_REQUESTS/)
+})
+
 test('server rejects legacy unprefixed env vars at startup', () => {
   const legacyCases = [
     ['PORT', '3001', 'IMAGE_COMPRESS_API_PORT'],
     ['PUBLIC_BASE_URL', 'http://127.0.0.1:3001', 'IMAGE_COMPRESS_API_PUBLIC_BASE_URL'],
-    ['RESULT_STORAGE_MAX_SIZE', '256MB', 'IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE']
+    ['RESULT_STORAGE_MAX_SIZE', '256MB', 'IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE'],
+    ['PROCESSING_CONCURRENCY', '1', 'IMAGE_COMPRESS_API_PROCESSING_CONCURRENCY']
   ] as const
 
   for (const [legacyEnvName, envValue, replacementEnvName] of legacyCases) {
@@ -848,6 +924,61 @@ test('compress route fails explicitly when temporary result storage is full', as
   assert.equal(response.statusCode, 507)
   assert.equal(response.json().error.code, 'INSUFFICIENT_STORAGE')
   assert.equal(response.json().error.message, `temporary result storage limit reached (${formatMegabyteSize(16)})`)
+})
+
+test('compress route fails explicitly when temporary upload staging storage is full', async (t) => {
+  const app = await createApp({
+    uploadStagingMaxBytes: 16
+  })
+  t.after(async () => {
+    await app.close()
+  })
+
+  const candidate = await createJpegCandidate(32, 32, 60, 6)
+  const requestBody = buildMultipartPayload([
+    {
+      kind: 'file',
+      fieldname: 'files',
+      fileName: 'upload-staging.jpg',
+      contentType: 'image/jpeg',
+      buffer: candidate
+    }
+  ])
+
+  const response = await app.inject({
+    method: 'POST',
+    url: `${API_BASE_PATH}/v1/compress`,
+    headers: {
+      authorization: AUTHORIZATION_HEADER,
+      'content-type': `multipart/form-data; boundary=${requestBody.boundary}`
+    },
+    payload: requestBody.payload
+  })
+
+  assert.equal(response.statusCode, 507)
+  assert.equal(response.json().error.code, 'INSUFFICIENT_STORAGE')
+  assert.equal(response.json().error.message, `temporary upload staging storage limit reached (${formatMegabyteSize(16)})`)
+})
+
+test('request gate returns 503 with Retry-After when capacity is exhausted', async () => {
+  const requestGate = new RequestGate({
+    maxActiveRequests: 1,
+    maxQueuedRequests: 0
+  })
+  const permit = await requestGate.acquire()
+
+  await assert.rejects(
+    () => requestGate.acquire(),
+    (error: unknown) => {
+      assert.ok(error instanceof HttpError)
+      assert.equal(error.statusCode, 503)
+      assert.equal(error.code, 'SERVICE_UNAVAILABLE')
+      assert.equal(error.headers?.['Retry-After'], '5')
+      return true
+    }
+  )
+
+  permit.release()
 })
 
 test('compress route handles all supported real fixture files as single-file uploads and preserves original file names', async (t) => {

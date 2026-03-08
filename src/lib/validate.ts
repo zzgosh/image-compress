@@ -2,7 +2,7 @@ export const DEFAULT_UPLOAD_MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
 export const DEFAULT_UPLOAD_MAX_FILE_COUNT = 30
 export const DEFAULT_UPLOAD_MAX_TOTAL_SIZE_BYTES = 80 * 1024 * 1024
 export const MAX_IMAGE_PIXELS = 60_000_000
-export const PROCESSING_CONCURRENCY = 2
+export const DEFAULT_PROCESSING_CONCURRENCY = 2
 
 export interface UploadLimits {
   maxFileCount: number

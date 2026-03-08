@@ -5,6 +5,7 @@
 - `POST /api/image-compress/v1/compress`：上传图片并返回结构化 JSON metadata
 - `GET /api/image-compress/v1/results/:resultId?token=...`：下载同一次压缩生成的临时产物
 - 单次压缩，多端复用：客户端先看 metadata 决策，再按 `download.url` 下载，不会重复压缩
+- 上传输入先落到临时文件，再进入压缩流程；可单独限制上传暂存目录和容量
 - 临时结果资源有边界：短 TTL、单次下载、总临时存储上限、过期自动清理
 - Bearer Token 鉴权（压缩接口）；下载接口使用一次性签名 URL
 - 输出格式与输入格式保持一致（不支持格式转换）
@@ -20,19 +21,30 @@
 
 ```text
 .
-|-- src/
-|   |-- server.ts              # Fastify 入口，环境变量解析与服务装配
-|   |-- routes/                # 压缩与结果下载路由
-|   |-- lib/                   # 压缩、鉴权、结果存储等核心逻辑
-|   `-- types/                 # API 类型与错误定义
-|-- tests/
-|   `-- compress.test.ts       # 端到端与启动配置测试
-|-- test_images/               # 测试夹具图片与异常样本
-|-- .env.example               # 环境变量示例
-|-- Dockerfile                 # 容器构建与运行入口
-|-- openapi.yaml               # OpenAPI 合约
-|-- package.json               # 脚本与依赖
-`-- .github/workflows/         # CI 与镜像构建工作流
+├── .env.example
+├── Dockerfile
+├── README.md
+├── openapi.yaml
+├── package.json
+├── src
+│   ├── lib
+│   │   ├── auth.ts           # Bearer Token 鉴权
+│   │   ├── compress.ts       # Sharp 压缩主逻辑
+│   │   ├── request-gate.ts   # 请求级并发限制与排队控制
+│   │   ├── result-store.ts   # 临时结果存储、TTL、一次性下载控制
+│   │   ├── upload-staging-store.ts # 上传暂存目录与容量控制
+│   │   ├── validate.ts       # 上传限制与文件名规范化
+│   │   └── zip.ts            # ZIP 归档生成
+│   ├── routes
+│   │   ├── compress.ts       # POST /api/image-compress/v1/compress
+│   │   └── results.ts        # GET /api/image-compress/v1/results/:resultId
+│   ├── server.ts             # Fastify 启动与全局错误处理
+│   └── types
+│       └── api.ts            # 公共类型与 HttpError
+├── test_images               # 仓库内真实样本 fixture（jpg/png/webp/svg）
+├── tests
+│   └── compress.test.ts
+```ithub/workflows/         # CI 与镜像构建工作流
 ```
 
 ## Protocol Overview
@@ -71,30 +83,7 @@ TOKEN_1="$(openssl rand -hex 32)"
 TOKEN_2="$(openssl rand -hex 32)"
 ```
 
-再写入 `.env`：
-
-```bash
-cat > .env <<'EOF'
-IMAGE_COMPRESS_API_TOKENS=replace_me_with_a_random_token_1,replace_me_with_a_random_token_2
-IMAGE_COMPRESS_API_PORT=3001
-IMAGE_COMPRESS_API_HOST=0.0.0.0
-IMAGE_COMPRESS_API_PUBLIC_BASE_URL=http://127.0.0.1:3001
-IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_SIZE=20MB
-IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT=30
-IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE=80MB
-IMAGE_COMPRESS_API_RESULT_TTL_SECONDS=300
-IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE=256MB
-EOF
-```
-
-说明：
-
-- `IMAGE_COMPRESS_API_PUBLIC_BASE_URL` 建议显式配置；这样返回的 `download.url` 会稳定指向外部可访问地址
-- `IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_SIZE` / `IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT` / `IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE` 是上传入口限制
-- `IMAGE_COMPRESS_API_RESULT_TTL_SECONDS` 是临时结果的保留时长
-- `IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE` 是服务端临时结果目录的总存储上限
-- 容量型环境变量支持原始字节整数，或使用大写 `MB` 后缀，例如 `20MB`、`80MB`、`256MB`
-- 整数型环境变量只接受纯数字，例如 `IMAGE_COMPRESS_API_RESULT_TTL_SECONDS=300`、`IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT=30`
+再写入 `.env`。
 
 ### 3) 类型检查 + 构建 + 启动
 
@@ -133,11 +122,6 @@ docker run --rm -p 3001:3001 \
   image-compress-api:local
 ```
 
-说明：
-
-- 生产环境更推荐用 Docker Compose + Nginx 反代
-- 不建议把后端端口直接暴露到公网
-
 ## Deployment Notes
 
 - 建议把服务放在反向代理（如 Nginx）之后
@@ -146,13 +130,10 @@ docker run --rm -p 3001:3001 \
   - 如果你把 `IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE` 调大了，也要同步把 Nginx 的 `client_max_body_size` 调大
   - 作用：避免请求还没到 Node/Fastify，就先被 Nginx 以请求体过大拦掉
 - 生产环境建议显式配置 `IMAGE_COMPRESS_API_PUBLIC_BASE_URL`
-- 如果未设置 `IMAGE_COMPRESS_API_RESULT_STORAGE_DIR`：
-  - 本机直接运行：默认落到系统临时目录下的 `image-compress-api-results`
-  - Docker 容器内运行：默认落到容器内的 `/tmp/image-compress-api-results`
-  - 如果容器重建且未挂载卷，这些临时结果会一起消失
-- 服务只会清理自己创建的临时结果文件，不会递归删除 `IMAGE_COMPRESS_API_RESULT_STORAGE_DIR` 里的其他内容
 
 ## Environment Variables
+
+说明：下表 `Default` 列表示“代码内置默认值”，不是 `.env.example` 里的示例部署值。
 
 | Name | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -163,6 +144,11 @@ docker run --rm -p 3001:3001 \
 | `IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_SIZE` | No | `20MB` | 单个上传文件大小上限 |
 | `IMAGE_COMPRESS_API_UPLOAD_MAX_FILE_COUNT` | No | `30` | 单次请求允许上传的最大文件数 |
 | `IMAGE_COMPRESS_API_UPLOAD_MAX_TOTAL_SIZE` | No | `80MB` | 单次请求所有上传文件的总大小上限 |
+| `IMAGE_COMPRESS_API_PROCESSING_CONCURRENCY` | No | `2` | 单进程内按图片维度执行的压缩并发 |
+| `IMAGE_COMPRESS_API_MAX_ACTIVE_REQUESTS` | No | `0` | 请求级最大活动请求数；`0` 表示关闭限制 |
+| `IMAGE_COMPRESS_API_MAX_QUEUED_REQUESTS` | No | `0` | 请求级最大排队请求数；仅在 `MAX_ACTIVE_REQUESTS > 0` 时生效 |
+| `IMAGE_COMPRESS_API_UPLOAD_STAGING_MAX_SIZE` | No | 不限 | 上传暂存目录的总存储上限 |
+| `IMAGE_COMPRESS_API_UPLOAD_STAGING_DIR` | No | 系统临时目录下的 `image-compress-api-upload-staging` | 上传暂存落盘目录；Docker 内默认对应 `/tmp/image-compress-api-upload-staging` |
 | `IMAGE_COMPRESS_API_RESULT_TTL_SECONDS` | No | `300` | 临时结果存活秒数 |
 | `IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE` | No | `256MB` | 临时结果总存储上限 |
 | `IMAGE_COMPRESS_API_RESULT_STORAGE_DIR` | No | 系统临时目录下的 `image-compress-api-results` | 临时结果落盘目录；Docker 内默认对应 `/tmp/image-compress-api-results` |
@@ -170,8 +156,11 @@ docker run --rm -p 3001:3001 \
 说明：
 
 - `IMAGE_COMPRESS_API_UPLOAD_*` 限制的是“客户端发进来的请求体”
+- `IMAGE_COMPRESS_API_UPLOAD_STAGING_*` 限制的是“服务端为上传输入创建的临时文件”
 - `IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE` 限制的是“服务端临时结果目录最多能占多少磁盘”
-- 这两类限制互相独立，分别控制入口流量和服务端临时存储
+- `IMAGE_COMPRESS_API_MAX_ACTIVE_REQUESTS` / `IMAGE_COMPRESS_API_MAX_QUEUED_REQUESTS` 命中后会返回 `503 SERVICE_UNAVAILABLE` 和 `Retry-After`
+- `IMAGE_COMPRESS_API_MAX_QUEUED_REQUESTS` 不能单独设置，必须配合 `IMAGE_COMPRESS_API_MAX_ACTIVE_REQUESTS`
+- 上传暂存和结果暂存互相独立，分别控制“输入落盘”和“输出落盘”
 
 Token 使用建议：
 
@@ -284,6 +273,7 @@ Success JSON 示例：
 - `413 PAYLOAD_TOO_LARGE`
 - `415 UNSUPPORTED_MEDIA_TYPE`
 - `422 PROCESSING_FAILED`
+- `503 SERVICE_UNAVAILABLE`
 - `500 INTERNAL_ERROR`
 - `507 INSUFFICIENT_STORAGE`
 
@@ -340,10 +330,12 @@ curl -X POST "http://127.0.0.1:3001/api/image-compress/v1/compress" \
 ## Resource Lifecycle
 
 - 压缩成功后，服务会把最终产物落到临时目录
+- 上传过程中的原始文件会先落到上传暂存目录，处理完成后立即删除
 - JSON metadata 会带回一次性 `download.url`
 - 客户端成功下载后，服务会删除该产物
 - 如果客户端下载中断，资源会保留到 TTL 到期，再由清理逻辑回收
-- 如果临时结果总大小超过 `IMAGE_COMPRESS_API_RESULT_STORAGE_MAX_SIZE`，新请求会返回 `507 INSUFFICIENT_STORAGE`
+- 如果上传暂存或结果存储超过上限，新请求会返回 `507 INSUFFICIENT_STORAGE`
+- 如果请求级活动/排队上限打满，新请求会返回 `503 SERVICE_UNAVAILABLE`
 
 ## Testing Checklist
 
@@ -363,43 +355,11 @@ npm run build
 - 多图上传时，metadata 返回 ZIP 信息且下载 URL 返回 ZIP
 - 单次下载成功后再次访问同一 `download.url`（应返回 `404`）
 - TTL 过期后的下载 URL（应返回 `404`）
-- 临时存储上限打满时（应返回 `507`）
+- 临时结果存储上限打满时（应返回 `507`）
+- 上传暂存上限打满时（应返回 `507`）
+- 请求级并发上限打满时（应返回 `503`，并带 `Retry-After`）
 
 补充：
 
 - 仓库内的 `test_images/` 会参与真实样本回归，覆盖支持格式与不支持格式
 - 如果本地刻意删除了该目录，相关测试会自动跳过，避免阻塞基础 CI
-
-## Directory Structure
-
-说明：
-
-- `local-docs/`：本地进度与临时文档目录，默认已在 `.gitignore` 中忽略，不会提交到仓库。
-
-```text
-.
-├── .env.example
-├── Dockerfile
-├── README.md
-├── openapi.yaml
-├── package.json
-├── src
-│   ├── lib
-│   │   ├── auth.ts           # Bearer Token 鉴权
-│   │   ├── compress.ts       # Sharp 压缩主逻辑
-│   │   ├── result-store.ts   # 临时结果存储、TTL、一次性下载控制
-│   │   ├── validate.ts       # 上传限制与文件名规范化
-│   │   └── zip.ts            # ZIP 归档生成
-│   ├── routes
-│   │   ├── compress.ts       # POST /api/image-compress/v1/compress
-│   │   └── results.ts        # GET /api/image-compress/v1/results/:resultId
-│   ├── server.ts             # Fastify 启动与全局错误处理
-│   └── types
-│       └── api.ts            # 公共类型与 HttpError
-├── test_images               # 仓库内真实样本 fixture（jpg/png/webp/svg）
-├── tests
-│   └── compress.test.ts
-└── local-docs
-    └── plan
-        └── ephemeral-result-resource.md
-```
