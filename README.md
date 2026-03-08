@@ -346,8 +346,8 @@ npm run build
 
 补充：
 
-- 如果本地存在未跟踪的 `test_images/` 目录，测试会自动追加真实样本回归
-- 如果该目录不存在，相关测试会自动跳过，不影响 CI
+- 仓库内的 `test_images/` 会参与真实样本回归，覆盖支持格式与不支持格式
+- 如果本地刻意删除了该目录，相关测试会自动跳过，避免阻塞基础 CI
 
 ## Directory Structure
 
@@ -375,6 +375,7 @@ npm run build
 │   ├── server.ts             # Fastify 启动与全局错误处理
 │   └── types
 │       └── api.ts            # 公共类型与 HttpError
+├── test_images               # 仓库内真实样本 fixture（jpg/png/webp/svg）
 ├── tests
 │   └── compress.test.ts
 └── local-docs

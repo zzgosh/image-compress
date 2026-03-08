@@ -827,7 +827,7 @@ test('compress route handles all supported real fixture files as a batch zip dow
   assert.ok((downloadResponse.headers['content-disposition'] ?? '').includes(`filename*=UTF-8''${encodeRfc5987Value(body.outputFileName)}`))
 })
 
-test('compress route rejects unsupported real fixture files explicitly', async (t) => {
+test('compress route rejects unsupported or undecodable real fixture files explicitly', async (t) => {
   const fixtures = await loadUnsupportedFixtureFiles()
   if (fixtures.length === 0) {
     t.skip('test_images/ is not present or does not contain unsupported fixtures')
@@ -860,7 +860,13 @@ test('compress route rejects unsupported real fixture files explicitly', async (
       payload: requestBody.payload
     })
 
+    const errorPayload = response.json().error
+    if (response.statusCode === 415) {
+      assert.equal(errorPayload.code, 'UNSUPPORTED_MEDIA_TYPE', fixture.fileName)
+      continue
+    }
+
     assert.equal(response.statusCode, 422, fixture.fileName)
-    assert.equal(response.json().error.code, 'PROCESSING_FAILED', fixture.fileName)
+    assert.equal(errorPayload.code, 'PROCESSING_FAILED', fixture.fileName)
   }
 })
