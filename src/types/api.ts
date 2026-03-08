@@ -4,6 +4,8 @@ export type ApiErrorCode =
   | 'PAYLOAD_TOO_LARGE'
   | 'UNSUPPORTED_MEDIA_TYPE'
   | 'PROCESSING_FAILED'
+  | 'NOT_FOUND'
+  | 'INSUFFICIENT_STORAGE'
   | 'INTERNAL_ERROR'
 
 export interface ApiErrorPayload {

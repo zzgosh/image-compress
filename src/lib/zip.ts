@@ -1,5 +1,6 @@
+import { createWriteStream } from 'node:fs'
+import { finished } from 'node:stream/promises'
 import archiver from 'archiver'
-import { PassThrough } from 'node:stream'
 import type { CompressedImageResult } from '../types/api.js'
 
 const splitFileName = (fileName: string): { baseName: string; extension: string } => {
@@ -34,21 +35,21 @@ export const withUniqueZipEntryNames = (files: CompressedImageResult[]): Compres
   })
 }
 
-export const createZipStream = (files: CompressedImageResult[]): NodeJS.ReadableStream => {
+export const createZipFile = async (files: CompressedImageResult[], filePath: string): Promise<void> => {
   const archive = archiver('zip', {
     zlib: { level: 9 }
   })
-  const passthrough = new PassThrough()
+  const output = createWriteStream(filePath)
 
   archive.on('error', (error: Error) => {
-    passthrough.destroy(error)
+    output.destroy(error)
   })
 
-  archive.pipe(passthrough)
+  archive.pipe(output)
   for (const file of withUniqueZipEntryNames(files)) {
     archive.append(file.buffer, { name: file.fileName })
   }
 
-  void archive.finalize()
-  return passthrough
+  await archive.finalize()
+  await finished(output)
 }
